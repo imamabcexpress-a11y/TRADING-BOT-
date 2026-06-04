@@ -1,0 +1,26 @@
+{
+  "defaultSymbol": "BINANCE:BTCUSDT",
+  "watchlist": [
+    "BINANCE:BTCUSDT",
+    "BINANCE:ETHUSDT",
+    "FX:EURUSD",
+    "FX:GBPUSD",
+    "FX:XAUUSD"
+  ],
+  "timeframes": {
+    "D": "1D",
+    "H4": 240,
+    "H1": 60,
+    "M15": 15,
+    "M5": 5,
+    "M1": 1
+  },
+  "multiTimeframeRoles": {
+    "D": "trend_direction",
+    "H4": "key_support_resistance",
+    "H1": "entry_setup",
+    "M15": "confirmation",
+    "M5": "scalp_execution",
+    "M1": "scalp_execution"
+  }
+}

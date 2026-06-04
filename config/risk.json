@@ -1,0 +1,21 @@
+{
+  "maxRiskPerTrade": 0.02,
+  "maxDailyRisk": 0.06,
+  "defaultRiskRewardRatio": 2.0,
+  "maxOpenPositions": 3,
+  "scalping": {
+    "maxRiskPerTrade": 0.01,
+    "targetRR": 1.5,
+    "maxHoldingTimeMinutes": 30
+  },
+  "swing": {
+    "maxRiskPerTrade": 0.02,
+    "targetRR": 3.0,
+    "maxHoldingTimeHours": 72
+  },
+  "trailingStop": {
+    "enabled": true,
+    "activationRR": 1.0,
+    "trailPercent": 0.5
+  }
+}
