@@ -54,65 +54,21 @@ export interface AIDecision {
   invalidation: string;
 }
 
-// Build the system prompt with all book knowledge
+// Build compact system prompt (optimized for API token limits)
 function buildSystemPrompt(): string {
-  return `You are an elite trading analyst AI combining the wisdom of three master trading books:
+  return `You are a professional trading analyst. Analyze using multi-timeframe confluence and price action.
 
-## YOUR KNOWLEDGE BASE:
+RULES:
+- Only trade with 5+/10 confluence (trend+S/R+pattern+EMA+momentum)
+- Min R:R 1.5:1. Use ATR*1.5 for SL distance.
+- Setups: pullback in trend, breakout retest, failed breakout, inside bar break, range break
+- If unsure = WAIT. No trade > bad trade.
+- Daily=trend, H4=S/R, H1=setup, M15=confirm
 
-### 1. "Trading in the Zone" (Mark Douglas)
-- Think in probabilities, not certainties
-- Every trade outcome is independent
-- 5 Fundamental Truths: anything can happen, you don't need to know what happens next to make money, random distribution of wins/losses, an edge is just higher probability, every moment is unique
-- NEVER trade when emotionally compromised
-- Kill switch: 3 consecutive losses = stop
-
-### 2. "Forex Price Action Scalping" (Bob Volman)
-- 7 Setups: DD (Double Doji Break), FB (First Break), SB (Second Break), BB (Block Break), RB (Range Break), IRB (Inside Range Break), ARB (Advanced Range Break)
-- Read candle bodies and wicks for conviction
-- Large body = strong conviction, small body = indecision
-- Long wicks = rejection of price levels
-- Wait for candle CLOSE for confirmation
-
-### 3. "The Art & Science of Technical Analysis" (Adam Grimes)
-- Market structure: HH+HL = uptrend, LL+LH = downtrend
-- S/R zones (not lines): More touches = stronger, higher TF > lower TF
-- Polarity principle: broken support becomes resistance
-- EMA alignment: 20>50>200 = bullish, opposite = bearish
-- Trend phases: Accumulation → Markup → Distribution → Markdown
-- Patterns that work: pullback in trend (55-65% WR), breakout retest (50-60%), failed breakout (55-65%)
-- ATR for stop loss: minimum 1.5x ATR distance
-
-## MULTI-TIMEFRAME FRAMEWORK:
-- Daily = Overall trend direction
-- H4 = Key support & resistance
-- H1 = Entry setup identification
-- M15 = Confirmation
-- M5/M1 = Scalping execution
-
-## CONFLUENCE SCORING (minimum 5/10 to trade):
-- Trend alignment with higher TF: +2
-- At key S/R level: +2
-- Candle pattern present: +1
-- EMA support/resistance: +1
-- Volume confirms: +1
-- Momentum (RSI) aligned: +1
-- Multi-TF agreement: +2
-
-## STRICT RULES:
-1. NEVER recommend a trade without at least 5/10 confluence
-2. ALWAYS define exact entry, SL, TP1, TP2, TP3
-3. Risk:Reward MUST be minimum 1:1.5
-4. Explain WHY in detail - what setup, what confirmation
-5. If unsure, say WAIT - no trade is better than a bad trade
-6. Consider current market phase (impulse vs correction)
-7. Check if price is at a decision point (S/R, EMA, pattern)
-
-## RESPONSE FORMAT:
-You MUST respond in valid JSON only. No markdown, no explanation outside JSON.`;
+Respond ONLY in valid JSON. No markdown.`;
 }
 
-// Build the user prompt with actual market data
+// Build compact user prompt with key data only
 function buildAnalysisPrompt(
   symbol: string,
   mtfResult: MultiTimeframeResult,
@@ -121,59 +77,26 @@ function buildAnalysisPrompt(
 ): string {
   const analyses = mtfResult.analyses;
   
-  // Summarize each timeframe
-  const tfSummaries: string[] = [];
-  for (const [tf, analysis] of Object.entries(analyses)) {
-    tfSummaries.push(`
-${tf}:
-  - Trend: ${analysis.trend.direction} (${analysis.trend.strength}), Phase: ${analysis.trend.phase}
-  - Bias: ${analysis.bias} (confidence: ${analysis.confidence}%)
-  - EMA20: ${analysis.ema20.toFixed(2)}, EMA50: ${analysis.ema50.toFixed(2)}, EMA200: ${analysis.ema200.toFixed(2)}
-  - RSI: ${analysis.rsi.toFixed(1)}
-  - ATR: ${analysis.atr.toFixed(2)}
-  - Patterns: ${analysis.patterns.length > 0 ? analysis.patterns.join(', ') : 'none'}
-  - Structure: ${analysis.structure.trend}
-  - S/R levels: ${analysis.srLevels.slice(0, 3).map(s => `${s.type}@${s.level.toFixed(2)}(str:${s.strength})`).join(', ') || 'none found'}`);
+  // Compact timeframe summaries
+  const tfLines: string[] = [];
+  for (const [tf, a] of Object.entries(analyses)) {
+    const srTop = a.srLevels.slice(0, 2).map(s => `${s.type[0]}:${s.level.toFixed(0)}`).join(',');
+    tfLines.push(`${tf}: trend=${a.trend.direction}(${a.trend.strength}) bias=${a.bias} RSI=${a.rsi.toFixed(0)} EMA20=${a.ema20.toFixed(0)} EMA50=${a.ema50.toFixed(0)} ATR=${a.atr.toFixed(0)} patterns=[${a.patterns.join(',')}] SR=[${srTop}]`);
   }
 
-  // Recent price action (last 10 candles)
-  const last10 = recentCandles.slice(-10).map(c => 
-    `[O:${c.open.toFixed(2)} H:${c.high.toFixed(2)} L:${c.low.toFixed(2)} C:${c.close.toFixed(2)} V:${c.volume.toFixed(0)}]`
-  ).join('\n  ');
+  // Last 5 candles compact
+  const last5 = recentCandles.slice(-5).map(c => 
+    `${c.close>c.open?'▲':'▼'}O${c.open.toFixed(0)}H${c.high.toFixed(0)}L${c.low.toFixed(0)}C${c.close.toFixed(0)}`
+  ).join(' ');
 
-  return `Analyze ${symbol} for a trade decision.
+  return `${symbol} @ ${currentPrice.toFixed(2)} | Bias: ${mtfResult.overallBias} | Confluence: ${mtfResult.confluenceScore}/10
 
-CURRENT PRICE: ${currentPrice.toFixed(2)}
-OVERALL BIAS FROM TECHNICALS: ${mtfResult.overallBias}
-CONFLUENCE SCORE: ${mtfResult.confluenceScore}/10
+${tfLines.join('\n')}
 
-MULTI-TIMEFRAME DATA:
-${tfSummaries.join('\n')}
+Last 5 H1 candles: ${last5}
 
-LAST 10 H1 CANDLES:
-  ${last10}
-
-Based on all your knowledge from the 3 books and the technical data above, provide your trading decision.
-
-Respond ONLY with this JSON structure:
-{
-  "action": "BUY" or "SELL" or "WAIT",
-  "confidence": <number 0-100>,
-  "entry": <price>,
-  "stopLoss": <price>,
-  "takeProfit1": <price>,
-  "takeProfit2": <price>,
-  "takeProfit3": <price>,
-  "riskRewardRatio": <number>,
-  "reasoning": "<detailed 2-3 sentence explanation of WHY this trade, referencing specific book concepts>",
-  "technicalFactors": ["<factor1>", "<factor2>", ...],
-  "riskWarnings": ["<warning1>", ...],
-  "marketContext": "<1 sentence market phase description>",
-  "setup": "<setup name from Volman or Grimes>",
-  "grade": "A" or "B" or "C",
-  "timeframe": "<primary timeframe for this trade>",
-  "invalidation": "<what invalidates this trade>"
-}`;
+Decide: BUY, SELL, or WAIT. Respond ONLY JSON:
+{"action":"BUY/SELL/WAIT","confidence":<0-100>,"entry":<price>,"stopLoss":<price>,"takeProfit1":<price>,"takeProfit2":<price>,"takeProfit3":<price>,"riskRewardRatio":<num>,"reasoning":"<2-3 sentences WHY, reference setup name>","technicalFactors":["<factor>"],"riskWarnings":["<warning>"],"marketContext":"<phase>","setup":"<name>","grade":"A/B/C","timeframe":"<tf>","invalidation":"<what breaks it>"}`;
 }
 
 // Call the AI API with fallback model chain
