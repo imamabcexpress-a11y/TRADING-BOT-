@@ -25,7 +25,7 @@ config();
 
 const API_BASE = process.env.AI_API_BASE_URL || 'https://api.bluesminds.com/v1';
 const API_KEY = process.env.AI_API_KEY || '';
-const MODEL = process.env.AI_MODEL || 'gpt-4o';
+const MODEL = process.env.AI_MODEL || 'qwen3.6-plus'; // Best multi-model for trading analysis
 
 export interface AIDecision {
   action: 'BUY' | 'SELL' | 'WAIT';
@@ -168,8 +168,12 @@ Respond ONLY with this JSON structure:
 }`;
 }
 
-// Call the AI API
+// Call the AI API (non-streaming mode for reliable JSON response)
 async function callAI(systemPrompt: string, userPrompt: string): Promise<string> {
+  if (!API_KEY) {
+    throw new Error('AI_API_KEY not configured in .env');
+  }
+
   try {
     const response = await axios.post(
       `${API_BASE}/chat/completions`,
@@ -179,22 +183,29 @@ async function callAI(systemPrompt: string, userPrompt: string): Promise<string>
           { role: 'system', content: systemPrompt },
           { role: 'user', content: userPrompt }
         ],
-        temperature: 0.3, // Low temp for more consistent analysis
-        max_tokens: 1500
+        temperature: 0.2, // Very low temp for consistent, precise analysis
+        max_tokens: 2000,
+        stream: false // IMPORTANT: disable streaming to get full JSON response
       },
       {
         headers: {
           'Authorization': `Bearer ${API_KEY}`,
           'Content-Type': 'application/json'
         },
-        timeout: 30000
+        timeout: 60000 // 60s timeout for complex analysis
       }
     );
 
-    return response.data.choices[0]?.message?.content || '';
+    const content = response.data.choices?.[0]?.message?.content || '';
+    if (!content) {
+      throw new Error('Empty response from AI');
+    }
+    return content;
   } catch (err: any) {
-    console.error('AI API Error:', err.response?.data || err.message);
-    throw new Error(`AI API failed: ${err.response?.status || 'unknown'} - ${err.message}`);
+    const status = err.response?.status || 'unknown';
+    const msg = err.response?.data?.error?.message || err.message;
+    console.error(`AI API Error [${status}]:`, msg);
+    throw new Error(`AI API failed: ${status} - ${msg}`);
   }
 }
 
