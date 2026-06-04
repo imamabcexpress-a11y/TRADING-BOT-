@@ -25,7 +25,15 @@ config();
 
 const API_BASE = process.env.AI_API_BASE_URL || 'https://api.bluesminds.com/v1';
 const API_KEY = process.env.AI_API_KEY || '';
-const MODEL = process.env.AI_MODEL || 'qwen3.6-plus'; // Best multi-model for trading analysis
+
+// Fallback model chain - tries each until one works
+const MODEL_CHAIN = [
+  process.env.AI_MODEL || 'gemini-3.5-flash',
+  'gpt-4o-mini',
+  'gemini-3.5-flash',
+  'qwen3.6-plus',
+  'kimi-k2.5',
+];
 
 export interface AIDecision {
   action: 'BUY' | 'SELL' | 'WAIT';
@@ -168,45 +176,52 @@ Respond ONLY with this JSON structure:
 }`;
 }
 
-// Call the AI API (non-streaming mode for reliable JSON response)
+// Call the AI API with fallback model chain
 async function callAI(systemPrompt: string, userPrompt: string): Promise<string> {
   if (!API_KEY) {
     throw new Error('AI_API_KEY not configured in .env');
   }
 
-  try {
-    const response = await axios.post(
-      `${API_BASE}/chat/completions`,
-      {
-        model: MODEL,
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: userPrompt }
-        ],
-        temperature: 0.2, // Very low temp for consistent, precise analysis
-        max_tokens: 2000,
-        stream: false // IMPORTANT: disable streaming to get full JSON response
-      },
-      {
-        headers: {
-          'Authorization': `Bearer ${API_KEY}`,
-          'Content-Type': 'application/json'
+  // Try each model in the chain until one succeeds
+  const uniqueModels = [...new Set(MODEL_CHAIN)];
+  
+  for (const model of uniqueModels) {
+    try {
+      console.log(`  Trying model: ${model}...`);
+      const response = await axios.post(
+        `${API_BASE}/chat/completions`,
+        {
+          model,
+          messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: userPrompt }
+          ],
+          temperature: 0.2,
+          max_tokens: 2000,
+          stream: false
         },
-        timeout: 60000 // 60s timeout for complex analysis
-      }
-    );
+        {
+          headers: {
+            'Authorization': `Bearer ${API_KEY}`,
+            'Content-Type': 'application/json'
+          },
+          timeout: 60000
+        }
+      );
 
-    const content = response.data.choices?.[0]?.message?.content || '';
-    if (!content) {
-      throw new Error('Empty response from AI');
+      const content = response.data.choices?.[0]?.message?.content || '';
+      if (!content) continue; // Try next model if empty
+      
+      console.log(`  ✅ Success with model: ${model}`);
+      return content;
+    } catch (err: any) {
+      const status = err.response?.status || 'timeout';
+      console.log(`  ❌ ${model} failed (${status}), trying next...`);
+      continue; // Try next model
     }
-    return content;
-  } catch (err: any) {
-    const status = err.response?.status || 'unknown';
-    const msg = err.response?.data?.error?.message || err.message;
-    console.error(`AI API Error [${status}]:`, msg);
-    throw new Error(`AI API failed: ${status} - ${msg}`);
   }
+
+  throw new Error(`All AI models failed: ${uniqueModels.join(', ')}`);
 }
 
 // Parse AI response to structured decision
