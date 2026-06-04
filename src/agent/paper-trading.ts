@@ -2,6 +2,14 @@
  * Paper Trading Simulation Engine
  * Simulates buy/sell execution based on signals
  * Tracks TP/SL hits, calculates W/L ratio and performance
+ * 
+ * REALISTIC FEATURES:
+ * - Starting balance: $100 (configurable)
+ * - Slippage: 0.04-0.1% per fill (randomized, always against trader)
+ * - Trading fees: 0.1% taker fee (Binance market order)
+ * - Position sizing: 2% risk per trade
+ * - Max 3 concurrent positions
+ * - Trailing stop activates at +1R
  */
 
 import { TradeSignal } from '../analysis/multi-timeframe.js';
@@ -61,12 +69,20 @@ export interface PaperAccount {
 
 export class PaperTradingEngine {
   private account: PaperAccount;
-  private riskPerTrade: number = 0.02; // 2%
+  private riskPerTrade: number = 0.02; // 2% of balance
   private maxOpenPositions: number = 3;
   private useTrailingStop: boolean = true;
   private trailingActivationR: number = 1.0;
+  
+  // Realistic Binance simulation
+  private slippagePercent: number; // 0.04-0.1% typical
+  private makerFee: number = 0.001; // 0.1% Binance maker fee
+  private takerFee: number = 0.001; // 0.1% Binance taker fee (market order)
 
-  constructor(startingBalance: number = 10000) {
+  constructor(startingBalance: number = 100, slippagePercent?: number) {
+    // Random slippage between 0.04% and 0.1% if not specified (realistic Binance)
+    this.slippagePercent = slippagePercent ?? parseFloat(process.env.SLIPPAGE_PERCENT || '0.05');
+
     this.account = {
       balance: startingBalance,
       startingBalance,
@@ -98,6 +114,24 @@ export class PaperTradingEngine {
     };
   }
 
+  // Apply realistic slippage (random within range, worse during volatile moments)
+  private applySlippage(price: number, direction: 'long' | 'short', isEntry: boolean): number {
+    // Slippage is always against the trader
+    const slipMult = (this.slippagePercent + Math.random() * 0.03) / 100; // base + 0-0.03% random
+    if (isEntry) {
+      // Entry: buy higher, sell lower
+      return direction === 'long' ? price * (1 + slipMult) : price * (1 - slipMult);
+    } else {
+      // Exit: sell lower, buy back higher
+      return direction === 'long' ? price * (1 - slipMult) : price * (1 + slipMult);
+    }
+  }
+
+  // Calculate trading fee (Binance taker = 0.1%)
+  private calculateFee(notionalValue: number): number {
+    return notionalValue * this.takerFee;
+  }
+
   // Execute a signal as a paper trade
   executeSignal(signal: TradeSignal, symbol: string): PaperTrade | null {
     // Check if we can open more positions
@@ -111,15 +145,29 @@ export class PaperTradingEngine {
     );
     if (existing) return null;
 
-    // Calculate position size based on risk
+    // Check minimum balance ($5 minimum to trade)
+    if (this.account.balance < 5) return null;
+
+    // Apply slippage to entry price (realistic market order fill)
+    const slippedEntry = this.applySlippage(signal.entry, signal.direction, true);
+
+    // Calculate position size based on risk (2% of balance)
     const riskAmount = this.account.balance * this.riskPerTrade;
-    const riskPerUnit = Math.abs(signal.entry - signal.stopLoss);
+    const riskPerUnit = Math.abs(slippedEntry - signal.stopLoss);
+    
+    // Position size in units
+    const positionSize = riskAmount / riskPerUnit;
+    const notionalValue = positionSize * slippedEntry;
+
+    // Deduct entry fee from balance
+    const entryFee = this.calculateFee(notionalValue);
+    this.account.balance -= entryFee;
 
     const trade: PaperTrade = {
       id: `PT_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
       symbol,
       direction: signal.direction,
-      entry: signal.entry,
+      entry: slippedEntry, // Slipped entry price
       stopLoss: signal.stopLoss,
       takeProfit1: signal.takeProfit1,
       takeProfit2: signal.takeProfit2,
@@ -237,22 +285,30 @@ export class PaperTradingEngine {
   }
 
   private closeTrade(trade: PaperTrade, closePrice: number, status: PaperTrade['status']): void {
-    trade.closePrice = closePrice;
+    // Apply slippage to exit price
+    const slippedExit = this.applySlippage(closePrice, trade.direction, false);
+    
+    trade.closePrice = slippedExit;
     trade.closeTime = Date.now();
     trade.status = status;
 
     const riskPerUnit = Math.abs(trade.entry - trade.stopLoss);
 
     if (trade.direction === 'long') {
-      trade.pnlR = (closePrice - trade.entry) / riskPerUnit;
+      trade.pnlR = (slippedExit - trade.entry) / riskPerUnit;
     } else {
-      trade.pnlR = (trade.entry - closePrice) / riskPerUnit;
+      trade.pnlR = (trade.entry - slippedExit) / riskPerUnit;
     }
 
     trade.pnlPercent = (trade.pnlR * this.riskPerTrade) * 100;
 
-    // Update account
-    const pnlUSD = trade.pnlR * trade.riskAmount;
+    // Calculate exit fee
+    const positionSize = trade.riskAmount / riskPerUnit;
+    const exitNotional = positionSize * slippedExit;
+    const exitFee = this.calculateFee(exitNotional);
+
+    // Update account (P&L minus exit fee)
+    const pnlUSD = (trade.pnlR * trade.riskAmount) - exitFee;
     this.account.balance += pnlUSD;
     this.account.totalPnL += pnlUSD;
     this.account.totalTrades++;
@@ -349,7 +405,7 @@ export class PaperTradingEngine {
   }
 
   // Reset account
-  reset(balance: number = 10000): void {
+  reset(balance: number = 100): void {
     this.account = {
       balance,
       startingBalance: balance,
