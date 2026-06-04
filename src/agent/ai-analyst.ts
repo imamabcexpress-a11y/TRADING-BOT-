@@ -27,12 +27,18 @@ const API_BASE = process.env.AI_API_BASE_URL || 'https://api.bluesminds.com/v1';
 const API_KEY = process.env.AI_API_KEY || '';
 
 // Fallback model chain - tries each until one works
+// NOTE: If your API key has "Model Restrictions", only restricted models will work.
+// Remove restrictions in dashboard OR list your allowed models here.
 const MODEL_CHAIN = [
   process.env.AI_MODEL || 'gemini-3.5-flash',
-  'gpt-4o-mini',
+  'gpt-5-chat',
+  'gemini-3.1-pro-preview',
+  'claude-sonnet-4-6',
   'gemini-3.5-flash',
+  'gpt-4o-mini',
   'qwen3.6-plus',
   'kimi-k2.5',
+  'deepseek-v4-pro',
 ];
 
 export interface AIDecision {
@@ -187,6 +193,80 @@ function parseAIResponse(raw: string): AIDecision | null {
   }
 }
 
+// Fallback: Generate decision from technical analysis alone (no AI needed)
+function technicalFallbackDecision(
+  mtfResult: MultiTimeframeResult,
+  currentPrice: number
+): AIDecision {
+  const h1 = mtfResult.analyses['H1'];
+  const confluence = mtfResult.confluenceScore;
+  const bias = mtfResult.overallBias;
+
+  // Only trade if confluence >= 5
+  if (confluence < 5 || !h1) {
+    return {
+      action: 'WAIT',
+      confidence: confluence * 10,
+      entry: currentPrice,
+      stopLoss: 0, takeProfit1: 0, takeProfit2: 0, takeProfit3: 0,
+      riskRewardRatio: 0,
+      reasoning: `Confluence ${confluence}/10 is below minimum threshold (5). Waiting for better setup.`,
+      technicalFactors: [`Overall bias: ${bias}`, `Confluence: ${confluence}/10`],
+      riskWarnings: ['Insufficient confluence for entry'],
+      marketContext: `${h1?.trend.direction || 'unknown'} trend, ${h1?.trend.phase || 'unknown'} phase`,
+      setup: 'none', grade: 'C', timeframe: 'H1', invalidation: 'N/A'
+    };
+  }
+
+  const atr = h1.atr || currentPrice * 0.015;
+  const direction = bias.includes('bullish') ? 'BUY' : 'SELL';
+  
+  let entry = currentPrice;
+  let sl: number, tp1: number, tp2: number, tp3: number;
+
+  if (direction === 'BUY') {
+    sl = entry - atr * 1.5;
+    tp1 = entry + atr * 1.5;
+    tp2 = entry + atr * 2.5;
+    tp3 = entry + atr * 4;
+  } else {
+    sl = entry + atr * 1.5;
+    tp1 = entry - atr * 1.5;
+    tp2 = entry - atr * 2.5;
+    tp3 = entry - atr * 4;
+  }
+
+  const rr = Math.abs(tp2 - entry) / Math.abs(sl - entry);
+  const grade = confluence >= 8 ? 'A' : confluence >= 6 ? 'B' : 'C';
+
+  // Build reasoning from technical data
+  const factors: string[] = [];
+  if (h1.trend.direction !== 'sideways') factors.push(`H1 trend: ${h1.trend.direction} (${h1.trend.strength})`);
+  if (h1.patterns.length > 0) factors.push(`Pattern: ${h1.patterns[0]}`);
+  if (h1.rsi < 30) factors.push('RSI oversold');
+  else if (h1.rsi > 70) factors.push('RSI overbought');
+  factors.push(`EMA20: ${h1.ema20.toFixed(0)}, price ${currentPrice > h1.ema20 ? 'above' : 'below'}`);
+
+  const reasoning = `Technical analysis (AI fallback): ${bias} bias with ${confluence}/10 confluence. ` +
+    `${h1.trend.direction} trend on H1 (${h1.trend.phase} phase). ` +
+    `${h1.patterns.length > 0 ? `${h1.patterns[0]} pattern detected. ` : ''}` +
+    `RSI at ${h1.rsi.toFixed(0)}, ATR=${atr.toFixed(0)} used for levels.`;
+
+  return {
+    action: direction,
+    confidence: Math.min(90, confluence * 10 + 10),
+    entry, stopLoss: sl, takeProfit1: tp1, takeProfit2: tp2, takeProfit3: tp3,
+    riskRewardRatio: rr,
+    reasoning,
+    technicalFactors: factors,
+    riskWarnings: ['Using technical fallback (AI unavailable)', 'Verify manually before following'],
+    marketContext: `${h1.trend.direction} trend, ${h1.trend.phase} phase`,
+    setup: h1.patterns[0] || 'trend_continuation',
+    grade, timeframe: 'H1',
+    invalidation: `Price closes ${direction === 'BUY' ? 'below' : 'above'} ${sl.toFixed(2)}`
+  };
+}
+
 // Main analysis function
 export async function analyzeWithAI(
   symbol: string,
@@ -199,33 +279,21 @@ export async function analyzeWithAI(
 
   console.log(`🤖 Requesting AI analysis for ${symbol}...`);
 
-  const rawResponse = await callAI(systemPrompt, userPrompt);
-  const decision = parseAIResponse(rawResponse);
+  try {
+    const rawResponse = await callAI(systemPrompt, userPrompt);
+    const decision = parseAIResponse(rawResponse);
 
-  if (!decision) {
-    // Fallback: WAIT decision
-    return {
-      action: 'WAIT',
-      confidence: 0,
-      entry: currentPrice,
-      stopLoss: 0,
-      takeProfit1: 0,
-      takeProfit2: 0,
-      takeProfit3: 0,
-      riskRewardRatio: 0,
-      reasoning: 'AI response could not be parsed. Staying flat for safety.',
-      technicalFactors: [],
-      riskWarnings: ['AI parsing failed - do not trade'],
-      marketContext: 'Unknown',
-      setup: 'none',
-      grade: 'C',
-      timeframe: 'H1',
-      invalidation: 'N/A'
-    };
+    if (decision) {
+      console.log(`🤖 AI Decision: ${decision.action} (${decision.confidence}% confidence)`);
+      return decision;
+    }
+  } catch (err) {
+    console.log(`⚠️ AI unavailable, using technical analysis fallback...`);
   }
 
-  console.log(`🤖 AI Decision: ${decision.action} (${decision.confidence}% confidence)`);
-  return decision;
+  // Fallback: use pure technical analysis
+  console.log(`📊 Using technical fallback for ${symbol}`);
+  return technicalFallbackDecision(mtfResult, currentPrice);
 }
 
 // Convert AI decision to TradeSignal (for paper trading engine)
