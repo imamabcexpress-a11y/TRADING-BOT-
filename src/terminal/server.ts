@@ -1,17 +1,15 @@
 /**
- * Trading Terminal Server
- * Real-time web-based terminal with TradingView chart integration
- * Shows live prices, multi-timeframe analysis, and signals
+ * Trading Terminal Server v2.0
+ * TradingView-style UI with multi-symbol monitoring & sound alerts
  */
 
 import express from 'express';
 import { createServer } from 'http';
 import { Server as SocketServer } from 'socket.io';
-import { connectToTradingView, getMultiTimeframeData, subscribeToQuotes } from '../data/tradingview-connector.js';
+import { connectToTradingView, getMultiTimeframeData, subscribeToQuotes, RealtimeQuote } from '../data/tradingview-connector.js';
 import { performMultiTimeframeAnalysis } from '../analysis/multi-timeframe.js';
-import { loadMemory, getPerformanceSummary, getRelevantLessons } from '../agent/memory.js';
-import { assessPsychologyState, ZONE_RULES } from '../knowledge/trading-in-the-zone.js';
-import { NEWS_TRADING_RULES } from '../knowledge/forex-factory-calendar.js';
+import { loadMemory, getPerformanceSummary } from '../agent/memory.js';
+import { assessPsychologyState } from '../knowledge/trading-in-the-zone.js';
 
 const app = express();
 const httpServer = createServer(app);
@@ -19,25 +17,16 @@ const io = new SocketServer(httpServer, { cors: { origin: "*" } });
 
 const PORT = process.env.PORT || 3000;
 
-// Serve the terminal HTML
+// Store active connections and quotes for watchlist
+const activeQuotes: Record<string, RealtimeQuote> = {};
+
 app.get('/', (req, res) => {
   res.send(getTerminalHTML());
 });
 
-// API endpoint for analysis
-app.get('/api/analyze/:symbol', async (req, res) => {
-  try {
-    const symbol = decodeURIComponent(req.params.symbol);
-    res.json({ status: 'analyzing', symbol, message: 'Check WebSocket for real-time updates' });
-  } catch (err) {
-    res.status(500).json({ error: String(err) });
-  }
-});
-
-// WebSocket connections
 io.on('connection', (socket) => {
   console.log('🖥️  Terminal client connected');
-  
+
   const memory = loadMemory();
   socket.emit('memory', {
     performance: getPerformanceSummary(memory),
@@ -45,81 +34,108 @@ io.on('connection', (socket) => {
     totalTrades: memory.performance.totalTrades
   });
 
+  // Send current watchlist quotes
+  socket.emit('watchlist-update', activeQuotes);
+
+  let tvConnection: any = null;
+  let unsubQuotes: (() => void) | null = null;
+  let analysisInterval: NodeJS.Timeout | null = null;
+
+  // Multi-symbol watchlist subscription
+  socket.on('subscribe-watchlist', async (data) => {
+    const { symbols } = data;
+    socket.emit('status', { message: `Connecting for watchlist...` });
+
+    try {
+      if (!tvConnection) {
+        tvConnection = await connectToTradingView();
+      }
+
+      unsubQuotes = subscribeToQuotes(tvConnection, symbols, (quote) => {
+        activeQuotes[quote.symbol] = quote;
+        socket.emit('quote', quote);
+        socket.emit('watchlist-update', activeQuotes);
+      });
+
+      socket.emit('status', { message: `Monitoring ${symbols.length} symbols live` });
+    } catch (err) {
+      socket.emit('error', { message: `Watchlist connection failed: ${err}` });
+    }
+  });
+
+  // Single symbol analysis
   socket.on('request-analysis', async (data) => {
     const { symbol } = data;
-    socket.emit('status', { message: `Connecting to TradingView for ${symbol}...` });
-    
+    socket.emit('status', { message: `Analyzing ${symbol}...` });
+
     try {
-      const connection = await connectToTradingView();
-      socket.emit('status', { message: `Connected! Fetching multi-timeframe data...` });
-      
-      // Subscribe to real-time quotes
-      const unsubQuotes = subscribeToQuotes(connection, [symbol], (quote) => {
-        socket.emit('quote', quote);
-      });
-      
-      // Fetch MTF data
-      const mtfData = await getMultiTimeframeData(connection, symbol, 200);
-      socket.emit('status', { message: `Data received. Running analysis...` });
-      
-      // Run analysis
+      if (!tvConnection) {
+        tvConnection = await connectToTradingView();
+      }
+
+      const mtfData = await getMultiTimeframeData(tvConnection, symbol, 200);
       const analysis = performMultiTimeframeAnalysis(mtfData, symbol);
+
       socket.emit('analysis', analysis);
-      
-      // Send candle data for charting
       socket.emit('candles', {
         symbol,
         timeframes: Object.fromEntries(
-          Object.entries(mtfData).map(([tf, candles]) => [tf, candles.slice(-100)])
+          Object.entries(mtfData).map(([tf, candles]) => [tf, candles.slice(-200)])
         )
       });
-      
-      // Keep connection alive for real-time updates
-      const interval = setInterval(async () => {
+
+      // Auto-refresh every 60s
+      if (analysisInterval) clearInterval(analysisInterval);
+      analysisInterval = setInterval(async () => {
         try {
-          if (connection.isConnected()) {
-            // Re-fetch M5 and M15 for fresh analysis
-            const freshM5 = mtfData['M5'] || [];
-            const freshAnalysis = performMultiTimeframeAnalysis(mtfData, symbol);
+          if (tvConnection && tvConnection.isConnected()) {
+            const freshData = await getMultiTimeframeData(tvConnection, symbol, 200);
+            const freshAnalysis = performMultiTimeframeAnalysis(freshData, symbol);
             socket.emit('analysis', freshAnalysis);
+            socket.emit('candles', {
+              symbol,
+              timeframes: Object.fromEntries(
+                Object.entries(freshData).map(([tf, candles]) => [tf, candles.slice(-200)])
+              )
+            });
           }
         } catch (err) {
-          console.error('Update error:', err);
+          console.error('Refresh error:', err);
         }
-      }, 60000); // Update every minute
-      
-      socket.on('disconnect', () => {
-        clearInterval(interval);
-        unsubQuotes();
-        connection.close().catch(() => {});
-        console.log('🖥️  Terminal client disconnected');
-      });
-      
+      }, 60000);
+
+      socket.emit('status', { message: `Live monitoring ${symbol}` });
     } catch (err) {
-      socket.emit('error', { message: `Connection failed: ${err}` });
+      socket.emit('error', { message: `Analysis failed: ${err}` });
     }
   });
-  
+
   socket.on('psychology-check', (state) => {
     const result = assessPsychologyState(state);
     socket.emit('psychology-result', result);
+  });
+
+  socket.on('disconnect', () => {
+    if (analysisInterval) clearInterval(analysisInterval);
+    if (unsubQuotes) unsubQuotes();
+    if (tvConnection) tvConnection.close().catch(() => {});
+    tvConnection = null;
+    console.log('🖥️  Terminal client disconnected');
   });
 });
 
 httpServer.listen(PORT, () => {
   console.log(`
 ╔══════════════════════════════════════════════════════════╗
-║           🤖 TRADING BOT AGENT TERMINAL                  ║
-║══════════════════════════════════════════════════════════║
-║  Server running at: http://localhost:${PORT}               ║
+║        🤖 TRADING BOT AGENT TERMINAL v2.0                ║
+╠══════════════════════════════════════════════════════════╣
+║  http://localhost:${PORT}                                  ║
 ║                                                          ║
-║  Features:                                               ║
-║  • Real-time TradingView price data                      ║
-║  • Multi-timeframe analysis (D/H4/H1/M15/M5)           ║
-║  • Book-based knowledge system                           ║
-║  • Signal generation with confluence scoring             ║
-║  • Psychology state monitoring                           ║
-║  • Trade memory & performance tracking                   ║
+║  ✨ NEW: TradingView-style UI                            ║
+║  ✨ NEW: Multi-symbol watchlist (BTC/ETH/GOLD)           ║
+║  ✨ NEW: Sound alerts on signals                         ║
+║  ✨ NEW: Timeframe switching                             ║
+║  ✨ NEW: Clickable watchlist sidebar                     ║
 ╚══════════════════════════════════════════════════════════╝
   `);
 });
@@ -130,420 +146,859 @@ function getTerminalHTML(): string {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Trading Bot Agent Terminal</title>
+  <title>Trading Bot Agent</title>
   <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.1.0/dist/lightweight-charts.standalone.production.js"></script>
   <style>
+    :root {
+      --bg-primary: #131722;
+      --bg-secondary: #1e222d;
+      --bg-tertiary: #2a2e39;
+      --bg-hover: #363a45;
+      --border: #2a2e39;
+      --text-primary: #d1d4dc;
+      --text-secondary: #787b86;
+      --text-muted: #4c525e;
+      --accent-blue: #2962ff;
+      --accent-green: #26a69a;
+      --accent-red: #ef5350;
+      --accent-yellow: #ff9800;
+      --accent-purple: #ab47bc;
+    }
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body {
-      font-family: 'JetBrains Mono', 'Fira Code', monospace;
-      background: #0a0e17;
-      color: #e1e5eb;
-      overflow-x: hidden;
+      font-family: -apple-system, BlinkMacSystemFont, 'Trebuchet MS', Roboto, Ubuntu, sans-serif;
+      background: var(--bg-primary);
+      color: var(--text-primary);
+      overflow: hidden;
+      height: 100vh;
     }
-    .header {
-      background: linear-gradient(135deg, #1a1f2e 0%, #0d1117 100%);
-      border-bottom: 1px solid #2d333b;
-      padding: 12px 20px;
+
+    /* === TOP TOOLBAR (TradingView style) === */
+    .toolbar {
+      height: 38px;
+      background: var(--bg-secondary);
+      border-bottom: 1px solid var(--border);
       display: flex;
       align-items: center;
-      justify-content: space-between;
+      padding: 0 8px;
+      gap: 2px;
     }
-    .header h1 {
-      font-size: 16px;
-      color: #58a6ff;
+    .toolbar-group {
       display: flex;
       align-items: center;
-      gap: 8px;
+      gap: 2px;
+      padding: 0 6px;
+      border-right: 1px solid var(--border);
+      height: 100%;
     }
-    .price-display {
-      font-size: 24px;
-      font-weight: bold;
-      color: #f0f6fc;
+    .toolbar-group:last-child { border-right: none; }
+    .tb-btn {
+      background: none;
+      border: none;
+      color: var(--text-secondary);
+      padding: 4px 8px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 12px;
+      font-weight: 500;
+      white-space: nowrap;
+      transition: all 0.15s;
     }
-    .price-change { font-size: 14px; margin-left: 10px; }
-    .price-change.up { color: #3fb950; }
-    .price-change.down { color: #f85149; }
-    
-    .grid {
+    .tb-btn:hover { background: var(--bg-tertiary); color: var(--text-primary); }
+    .tb-btn.active { background: var(--accent-blue); color: #fff; }
+    .tb-btn.symbol-btn {
+      font-size: 13px;
+      font-weight: 700;
+      color: var(--text-primary);
+      padding: 4px 12px;
+    }
+    .tb-btn.symbol-btn:hover { background: var(--bg-tertiary); }
+    .tb-price {
+      font-size: 18px;
+      font-weight: 700;
+      padding: 0 12px;
+      letter-spacing: -0.5px;
+    }
+    .tb-price.up { color: var(--accent-green); }
+    .tb-price.down { color: var(--accent-red); }
+    .tb-change {
+      font-size: 12px;
+      padding: 2px 6px;
+      border-radius: 3px;
+    }
+    .tb-change.up { color: var(--accent-green); background: rgba(38,166,154,0.1); }
+    .tb-change.down { color: var(--accent-red); background: rgba(239,83,80,0.1); }
+    .toolbar-spacer { flex: 1; }
+    .alert-toggle {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      font-size: 11px;
+      color: var(--text-secondary);
+    }
+    .alert-toggle input { cursor: pointer; }
+
+    /* === MAIN LAYOUT === */
+    .main-layout {
       display: grid;
-      grid-template-columns: 1fr 350px;
-      grid-template-rows: 1fr auto;
-      height: calc(100vh - 60px);
-      gap: 1px;
-      background: #21262d;
+      grid-template-columns: 60px 220px 1fr 320px;
+      grid-template-rows: 1fr 180px;
+      height: calc(100vh - 38px);
     }
-    
-    .chart-panel {
-      background: #0d1117;
-      position: relative;
-    }
-    #chart { width: 100%; height: 100%; }
-    
-    .sidebar {
-      background: #0d1117;
-      overflow-y: auto;
-      border-left: 1px solid #21262d;
+
+    /* === LEFT ICON BAR === */
+    .icon-bar {
+      background: var(--bg-secondary);
+      border-right: 1px solid var(--border);
       display: flex;
       flex-direction: column;
+      align-items: center;
+      padding-top: 8px;
+      gap: 4px;
+      grid-row: 1 / 3;
     }
-    
-    .panel {
-      border-bottom: 1px solid #21262d;
+    .icon-btn {
+      width: 42px;
+      height: 42px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 18px;
+      transition: all 0.15s;
+      border: none;
+      background: none;
+      color: var(--text-secondary);
+    }
+    .icon-btn:hover { background: var(--bg-tertiary); color: var(--text-primary); }
+    .icon-btn.active { background: var(--bg-tertiary); color: var(--accent-blue); }
+    .icon-divider {
+      width: 28px;
+      height: 1px;
+      background: var(--border);
+      margin: 4px 0;
+    }
+
+    /* === WATCHLIST PANEL === */
+    .watchlist-panel {
+      background: var(--bg-primary);
+      border-right: 1px solid var(--border);
+      overflow-y: auto;
+      grid-row: 1 / 3;
+    }
+    .watchlist-header {
+      padding: 10px 12px;
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--text-secondary);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      position: sticky;
+      top: 0;
+      background: var(--bg-primary);
+      z-index: 1;
+    }
+    .watchlist-item {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      padding: 10px 12px;
+      cursor: pointer;
+      border-bottom: 1px solid rgba(42,46,57,0.5);
+      transition: background 0.1s;
+    }
+    .watchlist-item:hover { background: var(--bg-secondary); }
+    .watchlist-item.active { background: var(--bg-tertiary); border-left: 2px solid var(--accent-blue); }
+    .wl-symbol {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text-primary);
+    }
+    .wl-name {
+      font-size: 10px;
+      color: var(--text-muted);
+      margin-top: 2px;
+    }
+    .wl-price {
+      text-align: right;
+      font-size: 13px;
+      font-weight: 500;
+    }
+    .wl-price.up { color: var(--accent-green); }
+    .wl-price.down { color: var(--accent-red); }
+    .wl-change {
+      text-align: right;
+      font-size: 10px;
+      margin-top: 2px;
+    }
+    .wl-change.up { color: var(--accent-green); }
+    .wl-change.down { color: var(--accent-red); }
+
+    /* === CHART AREA === */
+    .chart-area {
+      background: var(--bg-primary);
+      position: relative;
+      overflow: hidden;
+    }
+    #chart { width: 100%; height: 100%; }
+
+    /* === RIGHT PANEL (Analysis) === */
+    .analysis-panel {
+      background: var(--bg-primary);
+      border-left: 1px solid var(--border);
+      overflow-y: auto;
+      grid-row: 1 / 3;
+    }
+    .ap-section {
+      border-bottom: 1px solid var(--border);
       padding: 12px;
     }
-    .panel-title {
+    .ap-title {
       font-size: 11px;
+      font-weight: 600;
       text-transform: uppercase;
-      letter-spacing: 1px;
-      color: #8b949e;
-      margin-bottom: 8px;
+      letter-spacing: 0.5px;
+      color: var(--text-secondary);
+      margin-bottom: 10px;
       display: flex;
       align-items: center;
       gap: 6px;
     }
     
-    .signal-card {
-      background: #161b22;
-      border: 1px solid #30363d;
+    /* MTF Bias Grid */
+    .mtf-row {
+      display: flex;
+      align-items: center;
+      padding: 5px 0;
+      border-bottom: 1px solid rgba(42,46,57,0.3);
+    }
+    .mtf-row:last-child { border-bottom: none; }
+    .mtf-tf-label {
+      width: 36px;
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--text-secondary);
+    }
+    .mtf-bar {
+      flex: 1;
+      height: 6px;
+      background: var(--bg-tertiary);
+      border-radius: 3px;
+      overflow: hidden;
+      margin: 0 8px;
+    }
+    .mtf-bar-fill {
+      height: 100%;
+      border-radius: 3px;
+      transition: width 0.4s ease;
+    }
+    .mtf-bias-label {
+      width: 60px;
+      text-align: right;
+      font-size: 10px;
+      font-weight: 600;
+    }
+    .mtf-bias-label.bullish { color: var(--accent-green); }
+    .mtf-bias-label.bearish { color: var(--accent-red); }
+    .mtf-bias-label.neutral { color: var(--accent-yellow); }
+
+    /* Signal Card */
+    .signal-box {
+      background: var(--bg-secondary);
       border-radius: 8px;
       padding: 12px;
-      margin-top: 8px;
+      border: 1px solid var(--border);
     }
-    .signal-card.bullish { border-left: 3px solid #3fb950; }
-    .signal-card.bearish { border-left: 3px solid #f85149; }
-    .signal-card.neutral { border-left: 3px solid #d29922; }
-    
-    .signal-direction {
-      font-size: 14px;
-      font-weight: bold;
-      margin-bottom: 6px;
-    }
-    .signal-direction.long { color: #3fb950; }
-    .signal-direction.short { color: #f85149; }
-    
-    .signal-detail {
-      font-size: 11px;
-      color: #8b949e;
-      line-height: 1.8;
-    }
-    .signal-detail span { color: #e1e5eb; }
-    
-    .mtf-grid {
-      display: grid;
-      grid-template-columns: repeat(5, 1fr);
-      gap: 4px;
-    }
-    .mtf-item {
-      text-align: center;
-      padding: 6px 4px;
-      border-radius: 4px;
-      font-size: 10px;
-      background: #161b22;
-    }
-    .mtf-item.bullish { background: #0d2818; color: #3fb950; }
-    .mtf-item.bearish { background: #2d1117; color: #f85149; }
-    .mtf-item.neutral { background: #2d2200; color: #d29922; }
-    .mtf-label { font-weight: bold; font-size: 11px; }
-    
-    .confluence-bar {
-      height: 8px;
-      background: #21262d;
-      border-radius: 4px;
-      overflow: hidden;
-      margin: 8px 0;
-    }
-    .confluence-fill {
-      height: 100%;
-      border-radius: 4px;
-      transition: width 0.5s ease;
-    }
-    
-    .log-panel {
-      background: #0d1117;
-      border-top: 1px solid #21262d;
-      grid-column: 1 / -1;
-      max-height: 200px;
-      overflow-y: auto;
-      padding: 8px 12px;
-      font-size: 11px;
-    }
-    .log-entry {
-      padding: 2px 0;
-      border-bottom: 1px solid #161b22;
-      line-height: 1.6;
-    }
-    .log-time { color: #484f58; }
-    .log-info { color: #58a6ff; }
-    .log-warn { color: #d29922; }
-    .log-signal { color: #3fb950; }
-    .log-error { color: #f85149; }
-    
-    .controls {
-      display: flex;
-      gap: 8px;
-      padding: 8px 12px;
-      background: #161b22;
-      border-bottom: 1px solid #21262d;
-    }
-    .controls input {
-      flex: 1;
-      background: #0d1117;
-      border: 1px solid #30363d;
-      color: #e1e5eb;
-      padding: 6px 10px;
-      border-radius: 4px;
-      font-family: inherit;
-      font-size: 12px;
-    }
-    .controls button {
-      background: #238636;
-      color: white;
-      border: none;
-      padding: 6px 14px;
-      border-radius: 4px;
-      cursor: pointer;
-      font-family: inherit;
-      font-size: 12px;
-      font-weight: bold;
-    }
-    .controls button:hover { background: #2ea043; }
-    
-    .reasoning-list {
-      list-style: none;
-      font-size: 11px;
-      line-height: 1.8;
-    }
-    .reasoning-list li { padding: 2px 0; }
-    
-    .status-bar {
-      padding: 4px 12px;
-      background: #161b22;
-      font-size: 10px;
-      color: #484f58;
+    .signal-box.long { border-top: 3px solid var(--accent-green); }
+    .signal-box.short { border-top: 3px solid var(--accent-red); }
+    .signal-box.none { border-top: 3px solid var(--text-muted); }
+    .signal-header {
       display: flex;
       justify-content: space-between;
-      border-top: 1px solid #21262d;
+      align-items: center;
+      margin-bottom: 10px;
+    }
+    .signal-dir {
+      font-size: 16px;
+      font-weight: 800;
+      letter-spacing: 1px;
+    }
+    .signal-dir.long { color: var(--accent-green); }
+    .signal-dir.short { color: var(--accent-red); }
+    .signal-grade {
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-size: 11px;
+      font-weight: 700;
+    }
+    .signal-grade.A { background: var(--accent-green); color: #fff; }
+    .signal-grade.B { background: var(--accent-blue); color: #fff; }
+    .signal-grade.C { background: var(--accent-yellow); color: #000; }
+    .signal-levels {
+      display: grid;
+      grid-template-columns: auto 1fr;
+      gap: 4px 12px;
+      font-size: 11px;
+    }
+    .sl-label { color: var(--text-muted); }
+    .sl-value { font-weight: 600; text-align: right; }
+    .sl-value.green { color: var(--accent-green); }
+    .sl-value.red { color: var(--accent-red); }
+    .sl-value.yellow { color: var(--accent-yellow); }
+
+    /* Confluence meter */
+    .confluence-meter {
+      margin-top: 12px;
+    }
+    .cm-bar {
+      height: 10px;
+      background: var(--bg-tertiary);
+      border-radius: 5px;
+      overflow: hidden;
+    }
+    .cm-fill {
+      height: 100%;
+      border-radius: 5px;
+      transition: width 0.5s ease, background 0.3s;
+    }
+    .cm-label {
+      display: flex;
+      justify-content: space-between;
+      font-size: 10px;
+      color: var(--text-muted);
+      margin-top: 4px;
+    }
+
+    /* Reasoning */
+    .reasoning-item {
+      font-size: 11px;
+      padding: 4px 0;
+      line-height: 1.5;
+      color: var(--text-secondary);
+      border-bottom: 1px solid rgba(42,46,57,0.3);
+    }
+    .reasoning-item:last-child { border-bottom: none; }
+
+    /* === BOTTOM LOG PANEL === */
+    .log-panel {
+      background: var(--bg-secondary);
+      border-top: 1px solid var(--border);
+      overflow-y: auto;
+      padding: 8px 12px;
+      font-family: 'JetBrains Mono', 'Fira Code', monospace;
+      font-size: 11px;
+    }
+    .log-line {
+      padding: 2px 0;
+      display: flex;
+      gap: 8px;
+    }
+    .log-time { color: var(--text-muted); min-width: 70px; }
+    .log-msg { color: var(--text-secondary); }
+    .log-msg.info { color: var(--accent-blue); }
+    .log-msg.signal { color: var(--accent-green); font-weight: 600; }
+    .log-msg.warn { color: var(--accent-yellow); }
+    .log-msg.error { color: var(--accent-red); }
+
+    /* === STATUS BAR === */
+    .status-bar {
+      position: fixed;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      height: 22px;
+      background: var(--bg-tertiary);
+      border-top: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      padding: 0 12px;
+      font-size: 10px;
+      color: var(--text-muted);
+      justify-content: space-between;
+      z-index: 100;
     }
     .status-dot {
-      width: 6px; height: 6px;
+      width: 7px; height: 7px;
       border-radius: 50%;
       display: inline-block;
-      margin-right: 4px;
+      margin-right: 5px;
     }
-    .status-dot.connected { background: #3fb950; }
-    .status-dot.disconnected { background: #f85149; }
+    .status-dot.on { background: var(--accent-green); box-shadow: 0 0 4px var(--accent-green); }
+    .status-dot.off { background: var(--accent-red); }
+
+    /* Scrollbar */
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: var(--bg-tertiary); border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: var(--bg-hover); }
+
+    /* Notification popup */
+    .signal-notification {
+      position: fixed;
+      top: 50px;
+      right: 20px;
+      background: var(--bg-secondary);
+      border: 1px solid var(--accent-green);
+      border-radius: 12px;
+      padding: 16px 20px;
+      z-index: 9999;
+      animation: slideIn 0.3s ease;
+      box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+      max-width: 300px;
+    }
+    .signal-notification.short { border-color: var(--accent-red); }
+    @keyframes slideIn {
+      from { transform: translateX(100%); opacity: 0; }
+      to { transform: translateX(0); opacity: 1; }
+    }
+    .notif-title { font-size: 14px; font-weight: 700; margin-bottom: 6px; }
+    .notif-title.long { color: var(--accent-green); }
+    .notif-title.short { color: var(--accent-red); }
+    .notif-body { font-size: 11px; color: var(--text-secondary); line-height: 1.6; }
+    .notif-close {
+      position: absolute; top: 8px; right: 12px;
+      background: none; border: none; color: var(--text-muted);
+      cursor: pointer; font-size: 16px;
+    }
   </style>
 </head>
 <body>
-  <div class="header">
-    <h1>🤖 Trading Bot Agent</h1>
-    <div>
-      <span class="price-display" id="price">--</span>
-      <span class="price-change" id="price-change">--</span>
+  <!-- TOOLBAR -->
+  <div class="toolbar">
+    <div class="toolbar-group">
+      <button class="tb-btn symbol-btn" id="active-symbol" onclick="showSymbolSearch()">BTCUSDT</button>
+    </div>
+    <div class="toolbar-group" id="tf-buttons">
+      <button class="tb-btn" data-tf="M1" onclick="switchTF('M1')">1m</button>
+      <button class="tb-btn" data-tf="M5" onclick="switchTF('M5')">5m</button>
+      <button class="tb-btn" data-tf="M15" onclick="switchTF('M15')">15m</button>
+      <button class="tb-btn active" data-tf="H1" onclick="switchTF('H1')">1H</button>
+      <button class="tb-btn" data-tf="H4" onclick="switchTF('H4')">4H</button>
+      <button class="tb-btn" data-tf="D" onclick="switchTF('D')">1D</button>
+    </div>
+    <div class="toolbar-group">
+      <span class="tb-price" id="tb-price">--</span>
+      <span class="tb-change" id="tb-change">--</span>
+    </div>
+    <div class="toolbar-spacer"></div>
+    <div class="toolbar-group">
+      <div class="alert-toggle">
+        <input type="checkbox" id="sound-toggle" checked>
+        <label for="sound-toggle">🔊 Sound Alerts</label>
+      </div>
+    </div>
+    <div class="toolbar-group">
+      <button class="tb-btn" onclick="runAnalysis()" style="color:var(--accent-green);font-weight:700;">▶ Analyze</button>
     </div>
   </div>
-  
-  <div class="controls">
-    <input type="text" id="symbol-input" value="BINANCE:BTCUSDT" placeholder="Enter symbol (e.g. BINANCE:BTCUSDT)">
-    <button onclick="startAnalysis()">🔍 Analyze</button>
-  </div>
-  
-  <div class="grid">
-    <div class="chart-panel">
+
+  <!-- MAIN LAYOUT -->
+  <div class="main-layout">
+    <!-- Icon Bar -->
+    <div class="icon-bar">
+      <button class="icon-btn active" title="Watchlist" onclick="togglePanel('watchlist')">📋</button>
+      <button class="icon-btn" title="Analysis" onclick="togglePanel('analysis')">📊</button>
+      <div class="icon-divider"></div>
+      <button class="icon-btn" title="Alerts" onclick="togglePanel('alerts')">🔔</button>
+      <button class="icon-btn" title="Brain/Lessons" onclick="togglePanel('brain')">🧠</button>
+      <div class="icon-divider"></div>
+      <button class="icon-btn" title="Performance" onclick="showPerformance()">📈</button>
+    </div>
+
+    <!-- Watchlist -->
+    <div class="watchlist-panel" id="watchlist-panel">
+      <div class="watchlist-header">
+        <span>Watchlist</span>
+        <span style="color:var(--text-muted);">Live</span>
+      </div>
+      <div id="watchlist-items"></div>
+    </div>
+
+    <!-- Chart -->
+    <div class="chart-area">
       <div id="chart"></div>
     </div>
-    
-    <div class="sidebar">
-      <div class="panel">
-        <div class="panel-title">📊 Multi-Timeframe Bias</div>
-        <div class="mtf-grid" id="mtf-grid">
-          <div class="mtf-item neutral"><div class="mtf-label">D</div><div>--</div></div>
-          <div class="mtf-item neutral"><div class="mtf-label">H4</div><div>--</div></div>
-          <div class="mtf-item neutral"><div class="mtf-label">H1</div><div>--</div></div>
-          <div class="mtf-item neutral"><div class="mtf-label">M15</div><div>--</div></div>
-          <div class="mtf-item neutral"><div class="mtf-label">M5</div><div>--</div></div>
+
+    <!-- Analysis Panel -->
+    <div class="analysis-panel" id="analysis-panel">
+      <div class="ap-section">
+        <div class="ap-title">📊 Multi-Timeframe</div>
+        <div id="mtf-container">
+          <div class="mtf-row"><span class="mtf-tf-label">D</span><div class="mtf-bar"><div class="mtf-bar-fill" style="width:50%;background:var(--text-muted)"></div></div><span class="mtf-bias-label neutral">—</span></div>
+          <div class="mtf-row"><span class="mtf-tf-label">H4</span><div class="mtf-bar"><div class="mtf-bar-fill" style="width:50%;background:var(--text-muted)"></div></div><span class="mtf-bias-label neutral">—</span></div>
+          <div class="mtf-row"><span class="mtf-tf-label">H1</span><div class="mtf-bar"><div class="mtf-bar-fill" style="width:50%;background:var(--text-muted)"></div></div><span class="mtf-bias-label neutral">—</span></div>
+          <div class="mtf-row"><span class="mtf-tf-label">M15</span><div class="mtf-bar"><div class="mtf-bar-fill" style="width:50%;background:var(--text-muted)"></div></div><span class="mtf-bias-label neutral">—</span></div>
+          <div class="mtf-row"><span class="mtf-tf-label">M5</span><div class="mtf-bar"><div class="mtf-bar-fill" style="width:50%;background:var(--text-muted)"></div></div><span class="mtf-bias-label neutral">—</span></div>
         </div>
-        <div class="confluence-bar">
-          <div class="confluence-fill" id="confluence-bar" style="width: 0%; background: #484f58;"></div>
+        <div class="confluence-meter">
+          <div class="cm-bar"><div class="cm-fill" id="cm-fill" style="width:0%;background:var(--text-muted)"></div></div>
+          <div class="cm-label"><span>Confluence</span><span id="cm-score">0/10</span></div>
         </div>
-        <div style="font-size:11px; color:#8b949e;">Confluence: <span id="confluence-score">0</span>/10</div>
       </div>
-      
-      <div class="panel">
-        <div class="panel-title">🎯 Signal</div>
-        <div id="signal-container">
-          <div class="signal-card neutral">
-            <div style="color:#d29922; font-size:12px;">Waiting for analysis...</div>
+
+      <div class="ap-section">
+        <div class="ap-title">🎯 Signal</div>
+        <div id="signal-box">
+          <div class="signal-box none">
+            <div style="text-align:center;color:var(--text-muted);padding:10px;">Click Analyze to scan</div>
           </div>
         </div>
       </div>
-      
-      <div class="panel">
-        <div class="panel-title">🧠 Reasoning</div>
-        <ul class="reasoning-list" id="reasoning-list">
-          <li>Start an analysis to see reasoning</li>
-        </ul>
+
+      <div class="ap-section">
+        <div class="ap-title">🧠 Reasoning</div>
+        <div id="reasoning-container">
+          <div class="reasoning-item">Awaiting analysis...</div>
+        </div>
       </div>
-      
-      <div class="panel">
-        <div class="panel-title">📚 Active Lessons</div>
-        <ul class="reasoning-list" id="lessons-list">
-          <li>Loading knowledge base...</li>
-        </ul>
+
+      <div class="ap-section">
+        <div class="ap-title">📚 Lessons</div>
+        <div id="lessons-container">
+          <div class="reasoning-item">Loading knowledge base...</div>
+        </div>
       </div>
     </div>
-    
+
+    <!-- Log Panel -->
     <div class="log-panel" id="log-panel">
-      <div class="log-entry"><span class="log-time">[BOOT]</span> <span class="log-info">Trading Bot Agent initialized. Knowledge base loaded.</span></div>
+      <div class="log-line"><span class="log-time">SYSTEM</span><span class="log-msg info">Trading Bot Agent v2.0 initialized</span></div>
     </div>
-  </div>
-  
-  <div class="status-bar">
-    <span><span class="status-dot disconnected" id="status-dot"></span><span id="status-text">Disconnected</span></span>
-    <span id="status-message">Ready</span>
   </div>
 
+  <!-- Status Bar -->
+  <div class="status-bar">
+    <div><span class="status-dot off" id="status-dot"></span><span id="status-text">Disconnected</span></div>
+    <div id="status-msg">Ready</div>
+    <div>Multi-Symbol • Real-Time • TradingView WS</div>
+  </div>
+
+  <!-- Notification Container -->
+  <div id="notification-container"></div>
+
   <script>
+    // === STATE ===
     const socket = io();
-    let chart, candleSeries;
-    
-    // Initialize chart
+    let chart, candleSeries, volumeSeries;
+    let currentSymbol = 'BINANCE:BTCUSDT';
+    let currentTF = 'H1';
+    let candleData = {};
+    let soundEnabled = true;
+    let lastSignalId = null;
+
+    const WATCHLIST = [
+      { symbol: 'BINANCE:BTCUSDT', name: 'Bitcoin', short: 'BTC/USDT' },
+      { symbol: 'BINANCE:ETHUSDT', name: 'Ethereum', short: 'ETH/USDT' },
+      { symbol: 'TVC:GOLD', name: 'Gold Spot', short: 'XAU/USD' },
+      { symbol: 'BINANCE:SOLUSDT', name: 'Solana', short: 'SOL/USDT' },
+      { symbol: 'BINANCE:BNBUSDT', name: 'BNB', short: 'BNB/USDT' },
+      { symbol: 'FX:EURUSD', name: 'Euro/Dollar', short: 'EUR/USD' },
+    ];
+
+    // === SOUND SYSTEM ===
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    let audioCtx;
+    function initAudio() {
+      if (!audioCtx) audioCtx = new AudioCtx();
+    }
+    function playSignalSound(type) {
+      if (!soundEnabled) return;
+      initAudio();
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      osc.connect(gain);
+      gain.connect(audioCtx.destination);
+      if (type === 'long') {
+        osc.frequency.setValueAtTime(523, audioCtx.currentTime); // C5
+        osc.frequency.setValueAtTime(659, audioCtx.currentTime + 0.1); // E5
+        osc.frequency.setValueAtTime(784, audioCtx.currentTime + 0.2); // G5
+      } else {
+        osc.frequency.setValueAtTime(784, audioCtx.currentTime); // G5
+        osc.frequency.setValueAtTime(659, audioCtx.currentTime + 0.1); // E5
+        osc.frequency.setValueAtTime(523, audioCtx.currentTime + 0.2); // C5
+      }
+      gain.gain.setValueAtTime(0.3, audioCtx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.4);
+      osc.start(audioCtx.currentTime);
+      osc.stop(audioCtx.currentTime + 0.4);
+    }
+    function playAlertBeep() {
+      if (!soundEnabled) return;
+      initAudio();
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      osc.connect(gain);
+      gain.connect(audioCtx.destination);
+      osc.frequency.value = 880;
+      osc.type = 'sine';
+      gain.gain.setValueAtTime(0.2, audioCtx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.15);
+      osc.start(); osc.stop(audioCtx.currentTime + 0.15);
+    }
+
+    document.getElementById('sound-toggle').addEventListener('change', (e) => {
+      soundEnabled = e.target.checked;
+      initAudio();
+    });
+
+    // === CHART INIT ===
     function initChart() {
       const container = document.getElementById('chart');
       chart = LightweightCharts.createChart(container, {
         width: container.clientWidth,
         height: container.clientHeight,
-        layout: { background: { color: '#0d1117' }, textColor: '#8b949e' },
-        grid: { vertLines: { color: '#161b22' }, horzLines: { color: '#161b22' } },
-        crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
-        timeScale: { borderColor: '#21262d', timeVisible: true },
-        rightPriceScale: { borderColor: '#21262d' }
+        layout: { background: { color: '#131722' }, textColor: '#d1d4dc' },
+        grid: { vertLines: { color: '#1e222d' }, horzLines: { color: '#1e222d' } },
+        crosshair: { mode: LightweightCharts.CrosshairMode.Normal, vertLine: { labelBackgroundColor: '#2962ff' }, horzLine: { labelBackgroundColor: '#2962ff' } },
+        timeScale: { borderColor: '#2a2e39', timeVisible: true, secondsVisible: false },
+        rightPriceScale: { borderColor: '#2a2e39' }
       });
       candleSeries = chart.addCandlestickSeries({
-        upColor: '#3fb950', downColor: '#f85149',
-        borderUpColor: '#3fb950', borderDownColor: '#f85149',
-        wickUpColor: '#3fb950', wickDownColor: '#f85149'
+        upColor: '#26a69a', downColor: '#ef5350',
+        borderUpColor: '#26a69a', borderDownColor: '#ef5350',
+        wickUpColor: '#26a69a', wickDownColor: '#ef5350'
       });
-      window.addEventListener('resize', () => {
+      volumeSeries = chart.addHistogramSeries({
+        priceFormat: { type: 'volume' },
+        priceScaleId: '',
+        scaleMargins: { top: 0.85, bottom: 0 }
+      });
+
+      new ResizeObserver(() => {
         chart.applyOptions({ width: container.clientWidth, height: container.clientHeight });
-      });
+      }).observe(container);
     }
     initChart();
-    
+
+    // === WATCHLIST ===
+    function renderWatchlist() {
+      const container = document.getElementById('watchlist-items');
+      container.innerHTML = WATCHLIST.map(item => {
+        const isActive = item.symbol === currentSymbol ? ' active' : '';
+        return \`<div class="watchlist-item\${isActive}" onclick="selectSymbol('\${item.symbol}')">
+          <div>
+            <div class="wl-symbol">\${item.short}</div>
+            <div class="wl-name">\${item.name}</div>
+          </div>
+          <div>
+            <div class="wl-price" id="wl-price-\${item.symbol.replace(/[:.]/g,'-')}">--</div>
+            <div class="wl-change" id="wl-change-\${item.symbol.replace(/[:.]/g,'-')}">--</div>
+          </div>
+        </div>\`;
+      }).join('');
+    }
+    renderWatchlist();
+
+    function selectSymbol(symbol) {
+      currentSymbol = symbol;
+      const item = WATCHLIST.find(w => w.symbol === symbol);
+      document.getElementById('active-symbol').textContent = item ? item.short : symbol;
+      renderWatchlist();
+      runAnalysis();
+    }
+
+    // === TIMEFRAME SWITCH ===
+    function switchTF(tf) {
+      currentTF = tf;
+      document.querySelectorAll('#tf-buttons .tb-btn').forEach(btn => {
+        btn.classList.toggle('active', btn.dataset.tf === tf);
+      });
+      if (candleData[tf]) {
+        updateChart(candleData[tf]);
+      }
+    }
+
+    function updateChart(candles) {
+      if (!candles || candles.length === 0) return;
+      const cData = candles.map(c => ({ time: c.timestamp, open: c.open, high: c.high, low: c.low, close: c.close }));
+      const vData = candles.map(c => ({ time: c.timestamp, value: c.volume || 0, color: c.close >= c.open ? 'rgba(38,166,154,0.3)' : 'rgba(239,83,80,0.3)' }));
+      candleSeries.setData(cData);
+      volumeSeries.setData(vData);
+      chart.timeScale().fitContent();
+    }
+
+    // === ANALYSIS ===
+    function runAnalysis() {
+      log('Analyzing ' + currentSymbol + '...', 'info');
+      socket.emit('request-analysis', { symbol: currentSymbol });
+    }
+
+    // === NOTIFICATION ===
+    function showNotification(signal) {
+      const id = signal.direction + '_' + signal.entry.toFixed(0);
+      if (id === lastSignalId) return;
+      lastSignalId = id;
+
+      const container = document.getElementById('notification-container');
+      const div = document.createElement('div');
+      div.className = 'signal-notification ' + (signal.direction === 'short' ? 'short' : '');
+      div.innerHTML = \`
+        <button class="notif-close" onclick="this.parentElement.remove()">✕</button>
+        <div class="notif-title \${signal.direction}">🎯 \${signal.direction.toUpperCase()} SIGNAL [\${signal.grade}]</div>
+        <div class="notif-body">
+          Entry: \${signal.entry.toFixed(2)}<br>
+          SL: \${signal.stopLoss.toFixed(2)} | TP: \${signal.takeProfit2.toFixed(2)}<br>
+          R:R = 1:\${signal.riskRewardRatio.toFixed(1)}
+        </div>
+      \`;
+      container.appendChild(div);
+      setTimeout(() => div.remove(), 10000);
+
+      playSignalSound(signal.direction);
+    }
+
+    // === LOGGING ===
     function log(msg, type = 'info') {
       const panel = document.getElementById('log-panel');
-      const time = new Date().toLocaleTimeString();
-      panel.innerHTML += '<div class="log-entry"><span class="log-time">[' + time + ']</span> <span class="log-' + type + '">' + msg + '</span></div>';
+      const time = new Date().toLocaleTimeString('en-US', { hour12: false });
+      panel.innerHTML += \`<div class="log-line"><span class="log-time">\${time}</span><span class="log-msg \${type}">\${msg}</span></div>\`;
       panel.scrollTop = panel.scrollHeight;
     }
-    
-    function startAnalysis() {
-      const symbol = document.getElementById('symbol-input').value.trim();
-      if (!symbol) return;
-      log('Requesting analysis for ' + symbol + '...', 'info');
-      socket.emit('request-analysis', { symbol });
-    }
-    
-    // Socket events
+
+    // === SOCKET EVENTS ===
     socket.on('connect', () => {
-      document.getElementById('status-dot').className = 'status-dot connected';
+      document.getElementById('status-dot').className = 'status-dot on';
       document.getElementById('status-text').textContent = 'Connected';
       log('Connected to server', 'info');
+      // Subscribe watchlist
+      socket.emit('subscribe-watchlist', { symbols: WATCHLIST.map(w => w.symbol) });
     });
-    
+
     socket.on('disconnect', () => {
-      document.getElementById('status-dot').className = 'status-dot disconnected';
+      document.getElementById('status-dot').className = 'status-dot off';
       document.getElementById('status-text').textContent = 'Disconnected';
     });
-    
+
     socket.on('status', (data) => {
-      document.getElementById('status-message').textContent = data.message;
+      document.getElementById('status-msg').textContent = data.message;
       log(data.message, 'info');
     });
-    
+
     socket.on('quote', (quote) => {
-      document.getElementById('price').textContent = quote.price.toFixed(2);
-      const changeEl = document.getElementById('price-change');
-      const sign = quote.changePercent >= 0 ? '+' : '';
-      changeEl.textContent = sign + quote.changePercent.toFixed(2) + '%';
-      changeEl.className = 'price-change ' + (quote.changePercent >= 0 ? 'up' : 'down');
-    });
-    
-    socket.on('candles', (data) => {
-      const h1Candles = data.timeframes['H1'] || data.timeframes['M15'] || [];
-      if (h1Candles.length > 0) {
-        const chartData = h1Candles.map(c => ({
-          time: c.timestamp,
-          open: c.open, high: c.high, low: c.low, close: c.close
-        }));
-        candleSeries.setData(chartData);
-        chart.timeScale().fitContent();
-        log('Chart loaded: ' + h1Candles.length + ' candles (H1)', 'info');
+      // Update toolbar if current symbol
+      if (quote.symbol === currentSymbol || quote.symbol.includes(currentSymbol.split(':')[1])) {
+        const priceEl = document.getElementById('tb-price');
+        const changeEl = document.getElementById('tb-change');
+        priceEl.textContent = quote.price.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+        priceEl.className = 'tb-price ' + (quote.changePercent >= 0 ? 'up' : 'down');
+        const sign = quote.changePercent >= 0 ? '+' : '';
+        changeEl.textContent = sign + quote.changePercent.toFixed(2) + '%';
+        changeEl.className = 'tb-change ' + (quote.changePercent >= 0 ? 'up' : 'down');
+      }
+      // Update watchlist
+      const safeId = quote.symbol.replace(/[:.]/g, '-');
+      const priceEl = document.getElementById('wl-price-' + safeId);
+      const changeEl = document.getElementById('wl-change-' + safeId);
+      if (priceEl) {
+        priceEl.textContent = quote.price.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+        priceEl.className = 'wl-price ' + (quote.changePercent >= 0 ? 'up' : 'down');
+      }
+      if (changeEl) {
+        const s = quote.changePercent >= 0 ? '+' : '';
+        changeEl.textContent = s + quote.changePercent.toFixed(2) + '%';
+        changeEl.className = 'wl-change ' + (quote.changePercent >= 0 ? 'up' : 'down');
       }
     });
-    
+
+    socket.on('candles', (data) => {
+      candleData = data.timeframes;
+      if (candleData[currentTF]) {
+        updateChart(candleData[currentTF]);
+        log('Chart updated: ' + Object.keys(candleData).join(', '), 'info');
+      } else {
+        // Fallback to H1 or first available
+        const fallback = candleData['H1'] || candleData[Object.keys(candleData)[0]];
+        if (fallback) updateChart(fallback);
+      }
+    });
+
     socket.on('analysis', (analysis) => {
-      // Update MTF grid
-      const mtfGrid = document.getElementById('mtf-grid');
+      // MTF
       const tfs = ['D', 'H4', 'H1', 'M15', 'M5'];
-      mtfGrid.innerHTML = tfs.map(tf => {
+      const mtfContainer = document.getElementById('mtf-container');
+      mtfContainer.innerHTML = tfs.map(tf => {
         const a = analysis.analyses[tf];
         const bias = a ? a.bias : 'neutral';
-        const emoji = bias === 'bullish' ? '▲' : bias === 'bearish' ? '▼' : '—';
-        return '<div class="mtf-item ' + bias + '"><div class="mtf-label">' + tf + '</div><div>' + emoji + '</div></div>';
+        const pct = bias === 'bullish' ? 75 : bias === 'bearish' ? 25 : 50;
+        const color = bias === 'bullish' ? 'var(--accent-green)' : bias === 'bearish' ? 'var(--accent-red)' : 'var(--text-muted)';
+        const label = bias === 'bullish' ? 'BULL' : bias === 'bearish' ? 'BEAR' : '—';
+        return \`<div class="mtf-row">
+          <span class="mtf-tf-label">\${tf}</span>
+          <div class="mtf-bar"><div class="mtf-bar-fill" style="width:\${pct}%;background:\${color}"></div></div>
+          <span class="mtf-bias-label \${bias}">\${label}</span>
+        </div>\`;
       }).join('');
-      
+
       // Confluence
       const score = analysis.confluenceScore;
-      const bar = document.getElementById('confluence-bar');
-      bar.style.width = (score * 10) + '%';
-      bar.style.background = score >= 7 ? '#3fb950' : score >= 5 ? '#d29922' : '#f85149';
-      document.getElementById('confluence-score').textContent = score;
-      
+      const cmFill = document.getElementById('cm-fill');
+      cmFill.style.width = (score * 10) + '%';
+      cmFill.style.background = score >= 7 ? 'var(--accent-green)' : score >= 5 ? 'var(--accent-yellow)' : 'var(--accent-red)';
+      document.getElementById('cm-score').textContent = score + '/10';
+
       // Signal
-      const signalContainer = document.getElementById('signal-container');
+      const signalBox = document.getElementById('signal-box');
       if (analysis.signal) {
         const s = analysis.signal;
-        const dirClass = s.direction === 'long' ? 'bullish' : 'bearish';
-        signalContainer.innerHTML = '<div class="signal-card ' + dirClass + '">' +
-          '<div class="signal-direction ' + s.direction + '">' + s.direction.toUpperCase() + ' [' + s.grade + ']</div>' +
-          '<div class="signal-detail">' +
-          'Entry: <span>' + s.entry.toFixed(2) + '</span><br>' +
-          'Stop Loss: <span style="color:#f85149">' + s.stopLoss.toFixed(2) + '</span><br>' +
-          'TP1: <span style="color:#3fb950">' + s.takeProfit1.toFixed(2) + '</span><br>' +
-          'TP2: <span style="color:#3fb950">' + s.takeProfit2.toFixed(2) + '</span><br>' +
-          'TP3: <span style="color:#3fb950">' + s.takeProfit3.toFixed(2) + '</span><br>' +
-          'R:R = 1:' + s.riskRewardRatio.toFixed(1) + '<br>' +
-          'Setup: <span>' + s.setup + '</span><br>' +
-          'Invalidation: <span style="color:#d29922">' + s.invalidation + '</span>' +
-          '</div></div>';
-        log('SIGNAL: ' + s.direction.toUpperCase() + ' @ ' + s.entry.toFixed(2) + ' | SL: ' + s.stopLoss.toFixed(2) + ' | TP: ' + s.takeProfit2.toFixed(2), 'signal');
+        signalBox.innerHTML = \`<div class="signal-box \${s.direction}">
+          <div class="signal-header">
+            <span class="signal-dir \${s.direction}">\${s.direction.toUpperCase()}</span>
+            <span class="signal-grade \${s.grade}">\${s.grade}</span>
+          </div>
+          <div class="signal-levels">
+            <span class="sl-label">Entry</span><span class="sl-value">\${s.entry.toFixed(2)}</span>
+            <span class="sl-label">Stop Loss</span><span class="sl-value red">\${s.stopLoss.toFixed(2)}</span>
+            <span class="sl-label">TP1</span><span class="sl-value green">\${s.takeProfit1.toFixed(2)}</span>
+            <span class="sl-label">TP2</span><span class="sl-value green">\${s.takeProfit2.toFixed(2)}</span>
+            <span class="sl-label">TP3</span><span class="sl-value green">\${s.takeProfit3.toFixed(2)}</span>
+            <span class="sl-label">R:R</span><span class="sl-value yellow">1:\${s.riskRewardRatio.toFixed(1)}</span>
+            <span class="sl-label">Setup</span><span class="sl-value">\${s.setup}</span>
+          </div>
+        </div>\`;
+        showNotification(s);
+        log('🎯 SIGNAL: ' + s.direction.toUpperCase() + ' @ ' + s.entry.toFixed(2) + ' | RR 1:' + s.riskRewardRatio.toFixed(1), 'signal');
       } else {
-        signalContainer.innerHTML = '<div class="signal-card neutral"><div style="color:#d29922; font-size:12px;">No signal - Confluence ' + score + '/10 (need 5+)</div><div style="font-size:11px; color:#8b949e; margin-top:4px;">Overall bias: ' + analysis.overallBias + '</div></div>';
+        signalBox.innerHTML = \`<div class="signal-box none">
+          <div style="text-align:center;padding:10px;">
+            <div style="color:var(--text-muted);font-size:12px;">No Signal</div>
+            <div style="color:var(--text-muted);font-size:11px;margin-top:4px;">Confluence \${score}/10 (need 5+)</div>
+            <div style="color:var(--accent-yellow);font-size:11px;margin-top:4px;">\${analysis.overallBias}</div>
+          </div>
+        </div>\`;
       }
-      
+
       // Reasoning
-      const reasoningList = document.getElementById('reasoning-list');
-      reasoningList.innerHTML = analysis.reasoning.map(r => '<li>' + r + '</li>').join('');
-      
-      log('Analysis complete: ' + analysis.overallBias + ' | Confluence: ' + score + '/10', score >= 5 ? 'signal' : 'warn');
+      const reasoningContainer = document.getElementById('reasoning-container');
+      reasoningContainer.innerHTML = analysis.reasoning.map(r => \`<div class="reasoning-item">\${r}</div>\`).join('');
+
+      log('Analysis: ' + analysis.overallBias + ' | Score: ' + score + '/10', score >= 5 ? 'signal' : 'warn');
     });
-    
+
     socket.on('memory', (data) => {
-      const lessonsList = document.getElementById('lessons-list');
-      lessonsList.innerHTML = data.lessons.map(l => '<li>• ' + l + '</li>').join('');
-      log('Memory loaded: ' + data.totalTrades + ' trades recorded', 'info');
+      const container = document.getElementById('lessons-container');
+      container.innerHTML = data.lessons.map(l => \`<div class="reasoning-item">• \${l}</div>\`).join('');
     });
-    
-    socket.on('error', (data) => {
-      log('ERROR: ' + data.message, 'error');
-    });
-    
-    // Keyboard shortcut
-    document.getElementById('symbol-input').addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') startAnalysis();
-    });
+
+    socket.on('error', (data) => { log('ERROR: ' + data.message, 'error'); });
+
+    // === HELPERS ===
+    function togglePanel(panel) {
+      // Simple toggle logic (can expand)
+      playAlertBeep();
+    }
+    function showPerformance() { playAlertBeep(); log('Performance dashboard coming soon', 'warn'); }
+    function showSymbolSearch() {
+      const sym = prompt('Enter symbol (e.g. BINANCE:BTCUSDT, FX:EURUSD, TVC:GOLD):');
+      if (sym) selectSymbol(sym);
+    }
+
+    // Auto-start
+    setTimeout(() => { runAnalysis(); }, 1500);
   </script>
 </body>
 </html>`;
