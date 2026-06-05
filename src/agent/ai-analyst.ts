@@ -1,20 +1,15 @@
 /**
- * AI Multi-Model Trading Analyst v2
+ * AI Multi-Model Trading Analyst v3
  * 
- * Runs 4 AI models in PARALLEL for diverse analysis opinions:
- * - Gemini 3.5 Flash (Google - fast, analytical)
- * - Qwen 3.6 Plus (Alibaba - reasoning focused)
- * - MiniMax M2 (strong at structured data)
- * - Blackbox (general purpose)
+ * 4 Working Models (tested & confirmed):
+ * - gemini-3.5-flash (Google - cepat, analitik)
+ * - gemini-3.1-pro (Google - lebih detail)
+ * - grok-4.20-fast (xAI - cepat, bagus untuk pattern)
+ * - stepfun-ai/step-3.5-flash (StepFun - reasoning kuat)
  * 
- * Each model provides independent BUY/SELL/WAIT decision.
- * Final decision = majority vote + confidence weighting.
+ * Backup: multi-model, fallback, blackbox
  * 
- * Also generates book-based analysis from:
- * - Trading in the Zone (psychology/probability)
- * - Forex Price Action Scalping (candle patterns/setups)
- * - Art & Science of Technical Analysis (structure/S&R/indicators)
- * - Forex Factory Calendar (news awareness)
+ * Semua analisa ditampilkan dalam BAHASA INDONESIA
  */
 
 import axios from 'axios';
@@ -27,8 +22,10 @@ config();
 const API_BASE = process.env.AI_API_BASE_URL || 'https://api.bluesminds.com/v1';
 const API_KEY = process.env.AI_API_KEY || '';
 
-// 4 working models for parallel analysis
-const AI_MODELS = ['gemini-3.5-flash', 'qwen3.6-plus', 'MiniMax-M2', 'blackbox'];
+// Primary models (all tested working 200 OK)
+const PRIMARY_MODELS = ['gemini-3.5-flash', 'gemini-3.1-pro', 'grok-4.20-fast', 'stepfun-ai/step-3.5-flash'];
+// Backup if primary fails
+const BACKUP_MODELS = ['multi-model', 'fallback', 'blackbox'];
 
 export interface AIModelResult {
   model: string;
@@ -52,6 +49,7 @@ export interface BookAnalysis {
   artScienceTA: { trend: string; structure: string; srLevels: string; phase: string; emaStatus: string };
   forexFactory: { newsRisk: string; session: string; advice: string };
   multiTimeframe: { daily: string; h4: string; h1: string; m15: string; m5: string };
+  overallBookDecision: string; // Keputusan final dari buku dalam bahasa Indonesia
 }
 
 export interface AIDecision {
@@ -71,70 +69,71 @@ export interface AIDecision {
   grade: 'A' | 'B' | 'C';
   timeframe: string;
   invalidation: string;
-  // Multi-model results
   modelResults: AIModelResult[];
   bookAnalysis: BookAnalysis;
   voteSummary: string;
+  indonesianSummary: string; // Ringkasan bahasa Indonesia
 }
 
-// Compact prompt for each AI model
+// Prompt dengan instruksi bahasa Indonesia
 function buildPrompt(symbol: string, mtfResult: MultiTimeframeResult, candles: Candle[], price: number): { system: string; user: string } {
   const analyses = mtfResult.analyses;
   const tfLines: string[] = [];
   for (const [tf, a] of Object.entries(analyses)) {
     const sr = a.srLevels.slice(0, 2).map(s => `${s.type[0]}${s.level.toFixed(0)}`).join(',');
-    tfLines.push(`${tf}:${a.trend.direction}(${a.trend.strength}) bias=${a.bias} RSI=${a.rsi.toFixed(0)} EMA20=${a.ema20.toFixed(0)} ATR=${a.atr.toFixed(0)} pat=[${a.patterns.join(',')||'none'}] SR=[${sr}]`);
+    tfLines.push(`${tf}:${a.trend.direction}(${a.trend.strength}) bias=${a.bias} RSI=${a.rsi.toFixed(0)} EMA20=${a.ema20.toFixed(0)} EMA50=${a.ema50.toFixed(0)} ATR=${a.atr.toFixed(0)} pat=[${a.patterns.join(',')||'-'}] SR=[${sr||'-'}]`);
   }
   const last3 = candles.slice(-3).map(c => `${c.close>c.open?'+':'-'}${c.close.toFixed(0)}`).join(' ');
 
   return {
-    system: `Trading analyst. Multi-timeframe confluence. Only trade 5+/10 confluence, min RR 1.5. If unsure=WAIT. JSON only, no markdown.`,
-    user: `${symbol} @ ${price.toFixed(2)} | Bias:${mtfResult.overallBias} | Conf:${mtfResult.confluenceScore}/10
+    system: `You are a professional crypto/forex trading analyst. Use multi-timeframe confluence analysis. Only recommend trades with minimum 5/10 confluence and R:R >= 1.5. If uncertain = WAIT. Respond ONLY in valid JSON format.`,
+    user: `Analyze ${symbol} @ ${price.toFixed(2)}
+Bias: ${mtfResult.overallBias} | Confluence: ${mtfResult.confluenceScore}/10
 ${tfLines.join('\n')}
-Last3: ${last3}
-JSON: {"action":"BUY/SELL/WAIT","confidence":0-100,"entry":N,"stopLoss":N,"takeProfit1":N,"takeProfit2":N,"takeProfit3":N,"riskRewardRatio":N,"reasoning":"why","setup":"name"}`
+Recent closes: ${last3}
+
+Respond JSON only:
+{"action":"BUY"|"SELL"|"WAIT","confidence":0-100,"entry":${price.toFixed(0)},"stopLoss":0,"takeProfit1":0,"takeProfit2":0,"takeProfit3":0,"riskRewardRatio":0,"reasoning":"explain in 1-2 sentences","setup":"setup_name"}`
   };
 }
 
-// Call single model
+// Call single model with timeout
 async function callModel(model: string, system: string, user: string): Promise<AIModelResult> {
+  const empty: AIModelResult = { model, success: false, action: 'WAIT', confidence: 0, reasoning: '', entry: 0, stopLoss: 0, takeProfit1: 0, takeProfit2: 0, takeProfit3: 0, riskRewardRatio: 0, setup: '' };
   try {
     const resp = await axios.post(`${API_BASE}/chat/completions`, {
-      model, messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
-      temperature: 0.2, max_tokens: 800, stream: false
+      model,
+      messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
+      temperature: 0.2, max_tokens: 600, stream: false
     }, {
       headers: { 'Authorization': `Bearer ${API_KEY}`, 'Content-Type': 'application/json' },
-      timeout: 30000
+      timeout: 20000 // 20s max per model
     });
 
-    const raw = resp.data.choices?.[0]?.message?.content || '';
-    let cleaned = raw.trim();
-    if (cleaned.startsWith('```')) cleaned = cleaned.replace(/```json?\n?/g, '').replace(/```/g, '').trim();
-    
-    const parsed = JSON.parse(cleaned);
+    let raw = (resp.data.choices?.[0]?.message?.content || '').trim();
+    if (raw.startsWith('```')) raw = raw.replace(/```json?\n?/g, '').replace(/```/g, '').trim();
+    // Find JSON in response
+    const jsonMatch = raw.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) return { ...empty, error: 'no_json' };
+
+    const parsed = JSON.parse(jsonMatch[0]);
     return {
       model, success: true,
-      action: parsed.action || 'WAIT',
-      confidence: parsed.confidence || 0,
+      action: ['BUY','SELL','WAIT'].includes(parsed.action) ? parsed.action : 'WAIT',
+      confidence: Math.min(100, Math.max(0, parsed.confidence || 0)),
       reasoning: parsed.reasoning || '',
-      entry: parsed.entry || 0,
-      stopLoss: parsed.stopLoss || 0,
-      takeProfit1: parsed.takeProfit1 || 0,
-      takeProfit2: parsed.takeProfit2 || 0,
-      takeProfit3: parsed.takeProfit3 || 0,
-      riskRewardRatio: parsed.riskRewardRatio || 0,
+      entry: parsed.entry || 0, stopLoss: parsed.stopLoss || 0,
+      takeProfit1: parsed.takeProfit1 || 0, takeProfit2: parsed.takeProfit2 || 0,
+      takeProfit3: parsed.takeProfit3 || 0, riskRewardRatio: parsed.riskRewardRatio || 0,
       setup: parsed.setup || 'unknown'
     };
   } catch (err: any) {
-    return {
-      model, success: false, error: `${err.response?.status || 'timeout'}`,
-      action: 'WAIT', confidence: 0, reasoning: '', entry: 0, stopLoss: 0,
-      takeProfit1: 0, takeProfit2: 0, takeProfit3: 0, riskRewardRatio: 0, setup: ''
-    };
+    const code = err.response?.status || (err.code === 'ECONNABORTED' ? 'timeout' : 'error');
+    return { ...empty, error: String(code) };
   }
 }
 
-// Generate book-based analysis (local, no API needed)
+// Book-based analysis in BAHASA INDONESIA
 function generateBookAnalysis(mtfResult: MultiTimeframeResult, price: number): BookAnalysis {
   const h1 = mtfResult.analyses['H1'];
   const h4 = mtfResult.analyses['H4'];
@@ -143,60 +142,97 @@ function generateBookAnalysis(mtfResult: MultiTimeframeResult, price: number): B
   const m5 = mtfResult.analyses['M5'];
   const confluence = mtfResult.confluenceScore;
 
-  // Trading in the Zone
+  // === Trading in the Zone ===
   const zoneCanTrade = confluence >= 5;
+  const zoneReason = zoneCanTrade
+    ? `Confluence ${confluence}/10 memenuhi syarat minimum. Edge ada, eksekusi sesuai rencana.`
+    : `Confluence ${confluence}/10 BELUM cukup (min 5). Sabar menunggu setup yang lebih baik.`;
   const zoneMindset = zoneCanTrade
-    ? "Probability favors this trade. Accept the outcome regardless - it's one trade in a series."
-    : "Edge not present. Patience IS a position. Wait for the market to come to you.";
+    ? "Pikirkan dalam probabilitas. Terima hasil apapun — ini hanya satu trade dari banyak seri."
+    : "Tidak trading JUGA merupakan posisi. Disiplin > keserakahan.";
 
-  // Price Action Scalping (Volman)
-  let paSetup = 'No clear setup';
-  let paPattern = 'None detected';
-  let paSignal = 'FLAT';
+  // === Price Action Scalping (Volman) ===
+  let paSetup = 'Tidak ada setup yang jelas';
+  let paPattern = 'Tidak terdeteksi';
+  let paSignal = 'TUNGGU';
+  let paDetail = '';
+
   if (h1) {
-    if (h1.patterns.includes('inside_bar')) { paSetup = 'IRB (Inside Range Break)'; paPattern = 'Inside Bar at S/R'; paSignal = h1.bias === 'bullish' ? 'BUY on break above' : 'SELL on break below'; }
-    else if (h1.patterns.includes('pin_bar_bullish')) { paSetup = 'Pin Bar Rejection'; paPattern = 'Bullish Pin Bar'; paSignal = 'BUY'; }
-    else if (h1.patterns.includes('pin_bar_bearish')) { paSetup = 'Pin Bar Rejection'; paPattern = 'Bearish Pin Bar'; paSignal = 'SELL'; }
-    else if (h1.patterns.includes('engulfing_bullish')) { paSetup = 'FB (First Break)'; paPattern = 'Bullish Engulfing'; paSignal = 'BUY'; }
-    else if (h1.patterns.includes('engulfing_bearish')) { paSetup = 'FB (First Break)'; paPattern = 'Bearish Engulfing'; paSignal = 'SELL'; }
-    else if (h1.trend.phase === 'correction') { paSetup = 'Pullback in Trend'; paPattern = 'Correction reaching EMA'; paSignal = daily?.bias === 'bullish' ? 'BUY on EMA bounce' : 'SELL on EMA rejection'; }
+    const lastCandle = h1.lastCandle;
+    if (h1.patterns.includes('inside_bar')) {
+      paSetup = 'IRB (Inside Range Break)'; paPattern = 'Inside Bar di S/R';
+      paSignal = h1.bias === 'bullish' ? 'BUY jika break atas' : 'SELL jika break bawah';
+    } else if (h1.patterns.includes('pin_bar_bullish')) {
+      paSetup = 'Pin Bar Rejection'; paPattern = 'Bullish Pin Bar (ekor bawah panjang)';
+      paSignal = 'BUY — buyer menolak harga turun lebih jauh';
+    } else if (h1.patterns.includes('pin_bar_bearish')) {
+      paSetup = 'Pin Bar Rejection'; paPattern = 'Bearish Pin Bar (ekor atas panjang)';
+      paSignal = 'SELL — seller menolak harga naik lebih tinggi';
+    } else if (h1.patterns.includes('engulfing_bullish')) {
+      paSetup = 'First Break (FB)'; paPattern = 'Bullish Engulfing';
+      paSignal = 'BUY — candle bullish menelan bearish sebelumnya';
+    } else if (h1.patterns.includes('engulfing_bearish')) {
+      paSetup = 'First Break (FB)'; paPattern = 'Bearish Engulfing';
+      paSignal = 'SELL — candle bearish menelan bullish sebelumnya';
+    } else if (h1.trend.phase === 'correction' && daily) {
+      paSetup = 'Pullback in Trend';
+      paPattern = 'Koreksi ke EMA di trend utama';
+      paSignal = daily.bias === 'bullish' ? 'BUY saat bounce dari EMA/support' : 'SELL saat rejection dari EMA/resistance';
+    }
+
+    const bodyType = lastCandle.isDoji ? 'Doji (ragu-ragu)' : lastCandle.body > lastCandle.upperWick ? 'Body besar (keyakinan kuat)' : 'Wick panjang (ada rejection)';
+    paDetail = `Candle terakhir: ${lastCandle.isBullish ? '🟢 Bullish' : '🔴 Bearish'} | ${bodyType}. ${lastCandle.isDoji ? 'Pasar belum tentukan arah.' : ''}`;
   }
-  const paDetail = `Body/wick analysis: ${h1?.lastCandle.isBullish ? 'Last candle bullish' : 'Last candle bearish'}. ` +
-    `${h1?.lastCandle.isDoji ? 'Doji = indecision.' : h1?.lastCandle.body && h1.lastCandle.upperWick > h1.lastCandle.body ? 'Upper wick rejection.' : 'Clear directional move.'}`;
 
-  // Art & Science of Technical Analysis (Grimes)
-  const taTrend = daily ? `${daily.trend.direction} (${daily.trend.strength})` : 'Unknown';
-  const taStructure = h1 ? h1.structure.trend : 'Unknown';
-  const taSR = h4 ? h4.srLevels.slice(0, 3).map(s => `${s.type} @ ${s.level.toFixed(0)} (strength:${s.strength})`).join(', ') : 'None';
-  const taPhase = h1 ? h1.trend.phase : 'Unknown';
-  const emaStatus = h1 ? (h1.ema20 > h1.ema50 ? 'EMA20 > EMA50 (bullish alignment)' : 'EMA20 < EMA50 (bearish alignment)') + `, Price ${price > h1.ema20 ? 'above' : 'below'} EMA20` : 'N/A';
+  // === Art & Science of Technical Analysis (Grimes) ===
+  const taTrend = daily ? `${daily.trend.direction === 'up' ? '📈 Naik' : daily.trend.direction === 'down' ? '📉 Turun' : '➡️ Sideways'} (${daily.trend.strength === 'strong' ? 'kuat' : daily.trend.strength === 'moderate' ? 'sedang' : 'lemah'})` : 'Tidak ada data';
+  const taStructure = h1 ? (h1.structure.trend === 'bullish' ? 'HH+HL (Bullish)' : h1.structure.trend === 'bearish' ? 'LL+LH (Bearish)' : 'Ranging') : 'N/A';
+  const taSR = h4 ? h4.srLevels.slice(0, 3).map(s => `${s.type === 'support' ? 'S' : 'R'}:${s.level.toFixed(0)}(${s.strength}x)`).join(', ') : 'Tidak ada';
+  const taPhase = h1 ? (h1.trend.phase === 'impulse' ? '🚀 Impulse (momentum kuat)' : h1.trend.phase === 'correction' ? '🔄 Koreksi (pullback)' : h1.trend.phase === 'accumulation' ? '📦 Akumulasi' : '📤 Distribusi') : 'N/A';
+  const emaStatus = h1 ? `${h1.ema20 > h1.ema50 ? 'EMA20>50 (bullish)' : 'EMA20<50 (bearish)'}, Harga ${price > h1.ema20 ? 'DI ATAS' : 'DI BAWAH'} EMA20` : 'N/A';
 
-  // Forex Factory / Session
+  // === Forex Factory / Session ===
   const hour = new Date().getUTCHours();
-  let session = 'Off-hours';
-  if (hour >= 8 && hour < 16) session = 'London session (high volatility)';
-  else if (hour >= 13 && hour < 21) session = 'New York session (high volatility)';
-  else if (hour >= 0 && hour < 8) session = 'Asian session (lower volatility)';
-  const newsRisk = 'Check Forex Factory for upcoming high-impact events';
-  const newsAdvice = hour >= 13 && hour < 17 ? 'London/NY overlap - best liquidity for execution' : 'Monitor for news releases before entry';
+  let session = '🌙 Off-hours (volatilitas rendah)';
+  if (hour >= 8 && hour < 16) session = '🇬🇧 London (volatilitas tinggi)';
+  else if (hour >= 13 && hour < 21) session = '🇺🇸 New York (volatilitas tinggi)';
+  else if (hour >= 0 && hour < 8) session = '🇯🇵 Asia (volatilitas rendah-sedang)';
+  const overlap = (hour >= 13 && hour < 16) ? ' ⚡ OVERLAP London+NY (likuiditas terbaik)' : '';
+  const newsAdvice = 'Cek ForexFactory sebelum entry — hindari news high-impact 30 menit sebelum/sesudah.';
 
-  // Multi-timeframe
-  const mtfDaily = daily ? `${daily.trend.direction} trend (${daily.trend.strength}), bias: ${daily.bias}` : 'No data';
-  const mtfH4 = h4 ? `Bias: ${h4.bias}, ${h4.srLevels.length} S/R levels, RSI: ${h4.rsi.toFixed(0)}` : 'No data';
-  const mtfH1 = h1 ? `Bias: ${h1.bias}, patterns: [${h1.patterns.join(',')||'none'}], RSI: ${h1.rsi.toFixed(0)}` : 'No data';
-  const mtfM15 = m15 ? `Bias: ${m15.bias}, RSI: ${m15.rsi.toFixed(0)}, ${m15.patterns.length > 0 ? m15.patterns[0] : 'no pattern'}` : 'No data';
-  const mtfM5 = m5 ? `Bias: ${m5.bias}, RSI: ${m5.rsi.toFixed(0)}` : 'No data';
+  // === Multi-timeframe ===
+  const mtfDaily = daily ? `${daily.trend.direction === 'up' ? '📈' : daily.trend.direction === 'down' ? '📉' : '➡️'} ${daily.bias} (RSI:${daily.rsi.toFixed(0)})` : 'N/A';
+  const mtfH4 = h4 ? `${h4.bias} | ${h4.srLevels.length} level S/R | RSI:${h4.rsi.toFixed(0)}` : 'N/A';
+  const mtfH1 = h1 ? `${h1.bias} | Pattern: ${h1.patterns.join(',')||'tidak ada'} | RSI:${h1.rsi.toFixed(0)}` : 'N/A';
+  const mtfM15 = m15 ? `${m15.bias} | RSI:${m15.rsi.toFixed(0)}` : 'N/A';
+  const mtfM5 = m5 ? `${m5.bias} | RSI:${m5.rsi.toFixed(0)}` : 'N/A';
+
+  // === KEPUTUSAN BUKU (Bahasa Indonesia) ===
+  let bookDecision = '';
+  if (!zoneCanTrade) {
+    bookDecision = `⏸️ TUNGGU — Confluence hanya ${confluence}/10 (butuh min 5). Semua buku sepakat: JANGAN TRADING tanpa edge yang jelas. Sabar!`;
+  } else {
+    const trendAlign = daily && h1 && daily.bias === h1.bias;
+    if (trendAlign && h1.patterns.length > 0) {
+      bookDecision = `✅ LAYAK TRADE — Tren Daily ${daily!.bias} SEJALAN dengan H1. Pattern '${h1.patterns[0]}' terdeteksi. Confluence ${confluence}/10. Setup: ${paSetup}. Arah: ${paSignal}.`;
+    } else if (trendAlign) {
+      bookDecision = `⚠️ SIAP-SIAP — Tren sejalan (D+H1 = ${daily!.bias}) tapi belum ada pattern konfirmasi. Tunggu candle pattern di H1 atau M15.`;
+    } else {
+      bookDecision = `⚠️ HATI-HATI — Tren Daily (${daily?.bias||'?'}) dan H1 (${h1?.bias||'?'}) TIDAK sejalan. Counter-trend trading berisiko tinggi.`;
+    }
+  }
 
   return {
-    tradingInTheZone: { canTrade: zoneCanTrade, reason: zoneCanTrade ? `Confluence ${confluence}/10 meets threshold` : `Confluence ${confluence}/10 below minimum 5`, mindset: zoneMindset },
+    tradingInTheZone: { canTrade: zoneCanTrade, reason: zoneReason, mindset: zoneMindset },
     priceActionScalping: { setup: paSetup, pattern: paPattern, signal: paSignal, detail: paDetail },
     artScienceTA: { trend: taTrend, structure: taStructure, srLevels: taSR, phase: taPhase, emaStatus },
-    forexFactory: { newsRisk, session, advice: newsAdvice },
-    multiTimeframe: { daily: mtfDaily, h4: mtfH4, h1: mtfH1, m15: mtfM15, m5: mtfM5 }
+    forexFactory: { newsRisk: newsAdvice, session: session + overlap, advice: newsAdvice },
+    multiTimeframe: { daily: mtfDaily, h4: mtfH4, h1: mtfH1, m15: mtfM15, m5: mtfM5 },
+    overallBookDecision: bookDecision
   };
 }
 
-// Main: Run all 4 models in parallel + book analysis
+// Main function: 4 models parallel + book analysis
 export async function analyzeWithAI(
   symbol: string,
   mtfResult: MultiTimeframeResult,
@@ -208,107 +244,130 @@ export async function analyzeWithAI(
   const { system, user } = buildPrompt(symbol, mtfResult, recentCandles, currentPrice);
   const bookAnalysis = generateBookAnalysis(mtfResult, currentPrice);
 
-  // Run all 4 models in parallel
-  const modelPromises = AI_MODELS.map(m => callModel(m, system, user));
-  const results = await Promise.all(modelPromises);
+  // Run 4 primary models in parallel (20s timeout each)
+  const results = await Promise.all(PRIMARY_MODELS.map(m => callModel(m, system, user)));
+
+  // Check how many succeeded
+  const successCount = results.filter(r => r.success).length;
+  
+  // If less than 2 succeeded, try backup models
+  if (successCount < 2) {
+    console.log(`  ⚠️ Only ${successCount} primary succeeded, trying backups...`);
+    const backupResults = await Promise.all(BACKUP_MODELS.slice(0, 2).map(m => callModel(m, system, user)));
+    results.push(...backupResults);
+  }
 
   results.forEach(r => {
     if (r.success) console.log(`  ✅ ${r.model}: ${r.action} (${r.confidence}%)`);
     else console.log(`  ❌ ${r.model}: failed (${r.error})`);
   });
 
-  // Majority vote from successful models
-  const successful = results.filter(r => r.success && r.action !== 'WAIT');
+  // Majority vote
+  const successful = results.filter(r => r.success);
   const buyVotes = successful.filter(r => r.action === 'BUY');
   const sellVotes = successful.filter(r => r.action === 'SELL');
-  const waitCount = results.filter(r => !r.success || r.action === 'WAIT').length;
+  const waitVotes = successful.filter(r => r.action === 'WAIT');
 
   let finalAction: 'BUY' | 'SELL' | 'WAIT' = 'WAIT';
   let winners: AIModelResult[] = [];
 
   if (buyVotes.length >= 2 && buyVotes.length > sellVotes.length) {
-    finalAction = 'BUY';
-    winners = buyVotes;
+    finalAction = 'BUY'; winners = buyVotes;
   } else if (sellVotes.length >= 2 && sellVotes.length > buyVotes.length) {
-    finalAction = 'SELL';
-    winners = sellVotes;
+    finalAction = 'SELL'; winners = sellVotes;
+  } else if (buyVotes.length === 1 && sellVotes.length === 0 && waitVotes.length <= 1 && buyVotes[0].confidence >= 70) {
+    finalAction = 'BUY'; winners = buyVotes; // Strong single vote
+  } else if (sellVotes.length === 1 && buyVotes.length === 0 && waitVotes.length <= 1 && sellVotes[0].confidence >= 70) {
+    finalAction = 'SELL'; winners = sellVotes;
   }
 
-  // Check book analysis alignment
+  // Book veto: if books say no trade, override
   if (finalAction !== 'WAIT' && !bookAnalysis.tradingInTheZone.canTrade) {
-    finalAction = 'WAIT'; // Book says no trade
+    finalAction = 'WAIT';
+    winners = [];
   }
 
-  const voteSummary = `BUY:${buyVotes.length} SELL:${sellVotes.length} WAIT:${waitCount} → ${finalAction}`;
+  const voteSummary = `BUY:${buyVotes.length} SELL:${sellVotes.length} WAIT:${waitVotes.length+results.filter(r=>!r.success).length} → ${finalAction}`;
   console.log(`  📊 Vote: ${voteSummary}`);
 
-  // Build final decision
-  const avgConfidence = winners.length > 0
-    ? Math.round(winners.reduce((s, r) => s + r.confidence, 0) / winners.length)
-    : 0;
-
+  // Build final levels
   const h1 = mtfResult.analyses['H1'];
   const atr = h1?.atr || currentPrice * 0.015;
-
   let entry = currentPrice, sl = 0, tp1 = 0, tp2 = 0, tp3 = 0, rr = 0;
-  if (winners.length > 0 && winners[0].entry > 0) {
-    // Use first winner's levels
-    entry = winners[0].entry; sl = winners[0].stopLoss;
-    tp1 = winners[0].takeProfit1; tp2 = winners[0].takeProfit2; tp3 = winners[0].takeProfit3;
-    rr = winners[0].riskRewardRatio;
-  } else if (finalAction !== 'WAIT') {
-    // Generate from ATR
+
+  if (winners.length > 0) {
+    // Average the winners' levels
+    const avg = (arr: number[]) => arr.reduce((a, b) => a + b, 0) / arr.length;
+    const validEntries = winners.filter(w => w.entry > 0);
+    if (validEntries.length > 0) {
+      entry = avg(validEntries.map(w => w.entry));
+      sl = avg(validEntries.filter(w => w.stopLoss > 0).map(w => w.stopLoss)) || (finalAction === 'BUY' ? entry - atr * 1.5 : entry + atr * 1.5);
+      tp1 = avg(validEntries.filter(w => w.takeProfit1 > 0).map(w => w.takeProfit1)) || (finalAction === 'BUY' ? entry + atr * 1.5 : entry - atr * 1.5);
+      tp2 = avg(validEntries.filter(w => w.takeProfit2 > 0).map(w => w.takeProfit2)) || (finalAction === 'BUY' ? entry + atr * 2.5 : entry - atr * 2.5);
+      tp3 = avg(validEntries.filter(w => w.takeProfit3 > 0).map(w => w.takeProfit3)) || (finalAction === 'BUY' ? entry + atr * 4 : entry - atr * 4);
+    }
+  }
+  
+  if (finalAction !== 'WAIT' && sl === 0) {
     if (finalAction === 'BUY') { sl = entry - atr*1.5; tp1 = entry+atr*1.5; tp2 = entry+atr*2.5; tp3 = entry+atr*4; }
     else { sl = entry + atr*1.5; tp1 = entry-atr*1.5; tp2 = entry-atr*2.5; tp3 = entry-atr*4; }
-    rr = 2.0;
   }
+  rr = sl !== 0 ? Math.abs(tp2 - entry) / Math.abs(sl - entry) : 0;
 
+  const avgConfidence = winners.length > 0
+    ? Math.round(winners.reduce((s, r) => s + r.confidence, 0) / winners.length) : 0;
+  const grade = avgConfidence >= 75 ? 'A' : avgConfidence >= 55 ? 'B' : 'C';
+
+  // Build reasoning from winners
   const reasoning = winners.length > 0
     ? winners.map(w => `[${w.model}] ${w.reasoning}`).join(' | ')
-    : bookAnalysis.tradingInTheZone.reason;
+    : bookAnalysis.overallBookDecision;
 
-  const grade = avgConfidence >= 80 ? 'A' : avgConfidence >= 60 ? 'B' : 'C';
+  // Indonesian summary
+  let indonesianSummary = '';
+  if (finalAction === 'WAIT') {
+    indonesianSummary = `⏸️ TIDAK ADA SINYAL — ${bookAnalysis.overallBookDecision}`;
+  } else {
+    indonesianSummary = `${finalAction === 'BUY' ? '🟢 BELI' : '🔴 JUAL'} — ${winners.length} dari ${successful.length} AI setuju. ` +
+      `Entry: ${entry.toFixed(2)}, SL: ${sl.toFixed(2)}, TP: ${tp2.toFixed(2)}. ` +
+      `R:R = 1:${rr.toFixed(1)}. ${bookAnalysis.priceActionScalping.setup}. ` +
+      `Tren harian: ${bookAnalysis.artScienceTA.trend}. ${bookAnalysis.forexFactory.session}.`;
+  }
 
   return {
-    action: finalAction,
-    confidence: avgConfidence,
+    action: finalAction, confidence: avgConfidence,
     entry, stopLoss: sl, takeProfit1: tp1, takeProfit2: tp2, takeProfit3: tp3,
-    riskRewardRatio: rr,
-    reasoning,
+    riskRewardRatio: rr, reasoning,
     technicalFactors: [
-      `Multi-TF: ${mtfResult.overallBias}`,
-      `Book: ${bookAnalysis.priceActionScalping.setup}`,
-      `Structure: ${bookAnalysis.artScienceTA.structure}`,
+      `MTF Bias: ${mtfResult.overallBias}`,
+      `Buku PA: ${bookAnalysis.priceActionScalping.setup}`,
+      `Struktur: ${bookAnalysis.artScienceTA.structure}`,
       `EMA: ${bookAnalysis.artScienceTA.emaStatus}`,
     ],
-    riskWarnings: finalAction === 'WAIT' ? ['No consensus or insufficient confluence'] : [`Session: ${bookAnalysis.forexFactory.session}`],
-    marketContext: `${bookAnalysis.artScienceTA.trend} | ${bookAnalysis.artScienceTA.phase} phase`,
+    riskWarnings: finalAction === 'WAIT'
+      ? ['Tidak ada konsensus AI atau confluence kurang']
+      : [`${bookAnalysis.forexFactory.session}`, bookAnalysis.forexFactory.advice],
+    marketContext: `${bookAnalysis.artScienceTA.trend} | ${bookAnalysis.artScienceTA.phase}`,
     setup: winners[0]?.setup || bookAnalysis.priceActionScalping.setup,
-    grade,
-    timeframe: 'H1',
-    invalidation: sl > 0 ? `Price ${finalAction==='BUY'?'below':'above'} ${sl.toFixed(2)}` : 'N/A',
-    modelResults: results,
-    bookAnalysis,
-    voteSummary
+    grade, timeframe: 'H1',
+    invalidation: sl > 0 ? `Harga ${finalAction==='BUY'?'turun di bawah':'naik di atas'} ${sl.toFixed(2)}` : '-',
+    modelResults: results, bookAnalysis, voteSummary, indonesianSummary
   };
 }
 
 // Convert to signal for paper trading
 export function aiDecisionToSignal(decision: AIDecision): TradeSignal | null {
   if (decision.action === 'WAIT') return null;
-  if (decision.confidence < 55) return null;
+  if (decision.confidence < 50) return null;
   if (decision.riskRewardRatio < 1.3) return null;
+  if (decision.stopLoss === 0) return null;
 
   return {
     direction: decision.action === 'BUY' ? 'long' : 'short',
-    entry: decision.entry,
-    stopLoss: decision.stopLoss,
-    takeProfit1: decision.takeProfit1,
-    takeProfit2: decision.takeProfit2,
-    takeProfit3: decision.takeProfit3,
+    entry: decision.entry, stopLoss: decision.stopLoss,
+    takeProfit1: decision.takeProfit1, takeProfit2: decision.takeProfit2, takeProfit3: decision.takeProfit3,
     riskRewardRatio: decision.riskRewardRatio,
-    grade: decision.grade,
-    setup: decision.setup,
+    grade: decision.grade, setup: decision.setup,
     confluenceFactors: decision.technicalFactors,
     invalidation: decision.invalidation
   };
