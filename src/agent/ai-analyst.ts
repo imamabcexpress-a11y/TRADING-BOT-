@@ -22,10 +22,10 @@ config();
 const API_BASE = process.env.AI_API_BASE_URL || 'https://api.bluesminds.com/v1';
 const API_KEY = process.env.AI_API_KEY || '';
 
-// Primary models (all tested working 200 OK)
-const PRIMARY_MODELS = ['gemini-3.5-flash', 'gemini-3.1-pro', 'grok-4.20-fast', 'stepfun-ai/step-3.5-flash'];
-// Backup if primary fails
-const BACKUP_MODELS = ['multi-model', 'fallback', 'blackbox'];
+// Primary models (tested working & return proper JSON in content field)
+const PRIMARY_MODELS = ['gemini-3.5-flash', 'grok-4.20-fast', 'fallback', 'blackbox'];
+// Backup if primary fails (slower but work)
+const BACKUP_MODELS = ['gemini-3.1-pro', 'multi-model'];
 
 export interface AIModelResult {
   model: string;
@@ -107,13 +107,26 @@ async function callModel(model: string, system: string, user: string): Promise<A
       temperature: 0.2, max_tokens: 600, stream: false
     }, {
       headers: { 'Authorization': `Bearer ${API_KEY}`, 'Content-Type': 'application/json' },
-      timeout: 20000 // 20s max per model
+      timeout: 35000 // 35s max per model (some models are slower)
     });
 
-    let raw = (resp.data.choices?.[0]?.message?.content || '').trim();
+    const choice = resp.data.choices?.[0];
+    // Some models put response in content, others in reasoning_content
+    let raw = (choice?.message?.content || '').trim();
+    
+    // If content is empty/null, try reasoning_content (stepfun, qwen models do this)
+    if (!raw && choice?.message?.reasoning_content) {
+      raw = choice.message.reasoning_content.trim();
+    }
+    if (!raw && choice?.message?.reasoning) {
+      raw = choice.message.reasoning.trim();
+    }
+    
+    // Clean markdown wrappers
     if (raw.startsWith('```')) raw = raw.replace(/```json?\n?/g, '').replace(/```/g, '').trim();
-    // Find JSON in response
-    const jsonMatch = raw.match(/\{[\s\S]*\}/);
+    
+    // Find JSON object in response (handles models that add text before/after JSON)
+    const jsonMatch = raw.match(/\{[^{}]*"action"[^{}]*\}/s) || raw.match(/\{[\s\S]*\}/);
     if (!jsonMatch) return { ...empty, error: 'no_json' };
 
     const parsed = JSON.parse(jsonMatch[0]);
