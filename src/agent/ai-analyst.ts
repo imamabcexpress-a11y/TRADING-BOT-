@@ -22,26 +22,19 @@ config();
 const API_BASE = process.env.AI_API_BASE_URL || 'https://api.bluesminds.com/v1';
 const API_KEY = process.env.AI_API_KEY || '';
 
-// ALL 41 models from bluesminds API - all will be queried
-const ALL_MODELS = [
-  "gemini-3.5-flash", "grok-4.20-fast", "fallback", "blackbox",
-  "gemini-3.1-pro", "multi-model", "gpt-4o", "gpt-4o-mini",
-  "gpt-5-chat", "gpt-5-nano", "gpt-3.5-turbo-0613",
-  "claude-sonnet-4-6", "qwen3.6-plus", "qwen3.6-max-preview",
-  "qwen3.6-27b", "qwen/qwen3.5-397b-a17b",
-  "kimi-k2.5", "moonshotai/kimi-k2.6",
-  "deepseek-v4-pro", "deepseek-v4-flash", "accounts/fireworks/models/deepseek-v4-pro",
-  "gemini-3.1-pro-preview", "gemini-3-flash-preview", "gemini-3.1-flash-lite-preview",
-  "MiniMax-M2", "MiniMax-M2.1", "MiniMax-M2.7", "MiniMax-M2.1-lightning",
-  "minimax-m2", "minimax-m2.1", "minimaxai/minimax-m2.7",
-  "glm-4.6", "z-ai/glm-5.1", "openai/zai-org/GLM-4.7",
-  "openai/gpt-oss-120b", "stepfun-ai/step-3.5-flash",
-  "grok-4.20-0309-non-reasoning", "grok-code-fast-1",
-  "vllm-current", "race:moonshotai/kimi-k2.5|qwen/qwen3.5-397b-a17b",
+// 6 best models (tested working, different vendors for diverse opinions)
+// Run SEQUENTIALLY with delay to avoid 429 rate limit
+const ANALYSIS_MODELS = [
+  "gemini-3.5-flash",     // Google - fast, reliable
+  "grok-4.20-fast",       // xAI - good pattern analysis
+  "fallback",             // Routes to gpt-oss-120b - reliable
+  "blackbox",             // Fast, different perspective
+  "multi-model",          // Ensemble model
+  "MiniMax-M2",           // MiniMax - good reasoning
 ];
 
-// We run in batches of 8 parallel to avoid overwhelming
-const BATCH_SIZE = 8;
+// Delay between API calls to avoid 429 rate limit (ms)
+const DELAY_BETWEEN_CALLS = 2500; // 2.5 seconds
 
 export interface AIModelResult {
   model: string;
@@ -261,34 +254,35 @@ function generateBookAnalysis(mtfResult: MultiTimeframeResult, price: number): B
   };
 }
 
-// Main function: ALL models + book analysis
+// Main function: Run 6 models SEQUENTIALLY (avoid rate limit) + book analysis
 export async function analyzeWithAI(
   symbol: string,
   mtfResult: MultiTimeframeResult,
   recentCandles: Candle[],
   currentPrice: number
 ): Promise<AIDecision> {
-  console.log(`🤖 Requesting AI analysis for ${symbol} (${ALL_MODELS.length} models)...`);
+  console.log(`🤖 Requesting AI analysis for ${symbol} (${ANALYSIS_MODELS.length} models, sequential)...`);
 
   const { system, user } = buildPrompt(symbol, mtfResult, recentCandles, currentPrice);
   const bookAnalysis = generateBookAnalysis(mtfResult, currentPrice);
 
-  // Run ALL models in batches of 8 parallel
+  // Run models ONE BY ONE with delay to avoid 429 rate limit
   const allResults: AIModelResult[] = [];
-  for (let i = 0; i < ALL_MODELS.length; i += BATCH_SIZE) {
-    const batch = ALL_MODELS.slice(i, i + BATCH_SIZE);
-    const batchResults = await Promise.all(batch.map(m => callModel(m, system, user)));
-    allResults.push(...batchResults);
+  for (const model of ANALYSIS_MODELS) {
+    const result = await callModel(model, system, user);
+    allResults.push(result);
+    if (result.success) console.log(`  ✅ ${model}: ${result.action} (${result.confidence}%)`);
+    else console.log(`  ❌ ${model}: ${result.error}`);
+    
+    // Wait between calls to avoid rate limit
+    if (ANALYSIS_MODELS.indexOf(model) < ANALYSIS_MODELS.length - 1) {
+      await new Promise(r => setTimeout(r, DELAY_BETWEEN_CALLS));
+    }
   }
 
   const successCount = allResults.filter(r => r.success).length;
   const failCount = allResults.filter(r => !r.success).length;
-  console.log(`  📊 Results: ${successCount} success, ${failCount} failed out of ${ALL_MODELS.length}`);
-
-  allResults.forEach(r => {
-    if (r.success) console.log(`  ✅ ${r.model}: ${r.action} (${r.confidence}%)`);
-    else console.log(`  ❌ ${r.model}: ${r.error}`);
-  });
+  console.log(`  📊 Results: ${successCount} success, ${failCount} failed out of ${ANALYSIS_MODELS.length}`);
 
   // Majority vote from ALL successful models
   const successful = allResults.filter(r => r.success);
