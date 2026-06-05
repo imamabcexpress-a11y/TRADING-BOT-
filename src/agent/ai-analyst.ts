@@ -22,10 +22,26 @@ config();
 const API_BASE = process.env.AI_API_BASE_URL || 'https://api.bluesminds.com/v1';
 const API_KEY = process.env.AI_API_KEY || '';
 
-// Primary models (tested working & return proper JSON in content field)
-const PRIMARY_MODELS = ['gemini-3.5-flash', 'grok-4.20-fast', 'fallback', 'blackbox'];
-// Backup if primary fails (slower but work)
-const BACKUP_MODELS = ['gemini-3.1-pro', 'multi-model'];
+// ALL 41 models from bluesminds API - all will be queried
+const ALL_MODELS = [
+  "gemini-3.5-flash", "grok-4.20-fast", "fallback", "blackbox",
+  "gemini-3.1-pro", "multi-model", "gpt-4o", "gpt-4o-mini",
+  "gpt-5-chat", "gpt-5-nano", "gpt-3.5-turbo-0613",
+  "claude-sonnet-4-6", "qwen3.6-plus", "qwen3.6-max-preview",
+  "qwen3.6-27b", "qwen/qwen3.5-397b-a17b",
+  "kimi-k2.5", "moonshotai/kimi-k2.6",
+  "deepseek-v4-pro", "deepseek-v4-flash", "accounts/fireworks/models/deepseek-v4-pro",
+  "gemini-3.1-pro-preview", "gemini-3-flash-preview", "gemini-3.1-flash-lite-preview",
+  "MiniMax-M2", "MiniMax-M2.1", "MiniMax-M2.7", "MiniMax-M2.1-lightning",
+  "minimax-m2", "minimax-m2.1", "minimaxai/minimax-m2.7",
+  "glm-4.6", "z-ai/glm-5.1", "openai/zai-org/GLM-4.7",
+  "openai/gpt-oss-120b", "stepfun-ai/step-3.5-flash",
+  "grok-4.20-0309-non-reasoning", "grok-code-fast-1",
+  "vllm-current", "race:moonshotai/kimi-k2.5|qwen/qwen3.5-397b-a17b",
+];
+
+// We run in batches of 8 parallel to avoid overwhelming
+const BATCH_SIZE = 8;
 
 export interface AIModelResult {
   model: string;
@@ -245,38 +261,37 @@ function generateBookAnalysis(mtfResult: MultiTimeframeResult, price: number): B
   };
 }
 
-// Main function: 4 models parallel + book analysis
+// Main function: ALL models + book analysis
 export async function analyzeWithAI(
   symbol: string,
   mtfResult: MultiTimeframeResult,
   recentCandles: Candle[],
   currentPrice: number
 ): Promise<AIDecision> {
-  console.log(`🤖 Requesting AI analysis for ${symbol}...`);
+  console.log(`🤖 Requesting AI analysis for ${symbol} (${ALL_MODELS.length} models)...`);
 
   const { system, user } = buildPrompt(symbol, mtfResult, recentCandles, currentPrice);
   const bookAnalysis = generateBookAnalysis(mtfResult, currentPrice);
 
-  // Run 4 primary models in parallel (20s timeout each)
-  const results = await Promise.all(PRIMARY_MODELS.map(m => callModel(m, system, user)));
-
-  // Check how many succeeded
-  const successCount = results.filter(r => r.success).length;
-  
-  // If less than 2 succeeded, try backup models
-  if (successCount < 2) {
-    console.log(`  ⚠️ Only ${successCount} primary succeeded, trying backups...`);
-    const backupResults = await Promise.all(BACKUP_MODELS.slice(0, 2).map(m => callModel(m, system, user)));
-    results.push(...backupResults);
+  // Run ALL models in batches of 8 parallel
+  const allResults: AIModelResult[] = [];
+  for (let i = 0; i < ALL_MODELS.length; i += BATCH_SIZE) {
+    const batch = ALL_MODELS.slice(i, i + BATCH_SIZE);
+    const batchResults = await Promise.all(batch.map(m => callModel(m, system, user)));
+    allResults.push(...batchResults);
   }
 
-  results.forEach(r => {
+  const successCount = allResults.filter(r => r.success).length;
+  const failCount = allResults.filter(r => !r.success).length;
+  console.log(`  📊 Results: ${successCount} success, ${failCount} failed out of ${ALL_MODELS.length}`);
+
+  allResults.forEach(r => {
     if (r.success) console.log(`  ✅ ${r.model}: ${r.action} (${r.confidence}%)`);
-    else console.log(`  ❌ ${r.model}: failed (${r.error})`);
+    else console.log(`  ❌ ${r.model}: ${r.error}`);
   });
 
-  // Majority vote
-  const successful = results.filter(r => r.success);
+  // Majority vote from ALL successful models
+  const successful = allResults.filter(r => r.success);
   const buyVotes = successful.filter(r => r.action === 'BUY');
   const sellVotes = successful.filter(r => r.action === 'SELL');
   const waitVotes = successful.filter(r => r.action === 'WAIT');
@@ -300,7 +315,7 @@ export async function analyzeWithAI(
     winners = [];
   }
 
-  const voteSummary = `BUY:${buyVotes.length} SELL:${sellVotes.length} WAIT:${waitVotes.length+results.filter(r=>!r.success).length} → ${finalAction}`;
+  const voteSummary = `BUY:${buyVotes.length} SELL:${sellVotes.length} WAIT:${waitVotes.length} FAIL:${failCount} → ${finalAction}`;
   console.log(`  📊 Vote: ${voteSummary}`);
 
   // Build final levels
@@ -364,7 +379,7 @@ export async function analyzeWithAI(
     setup: winners[0]?.setup || bookAnalysis.priceActionScalping.setup,
     grade, timeframe: 'H1',
     invalidation: sl > 0 ? `Harga ${finalAction==='BUY'?'turun di bawah':'naik di atas'} ${sl.toFixed(2)}` : '-',
-    modelResults: results, bookAnalysis, voteSummary, indonesianSummary
+    modelResults: allResults, bookAnalysis, voteSummary, indonesianSummary
   };
 }
 

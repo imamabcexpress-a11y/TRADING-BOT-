@@ -441,14 +441,17 @@ socket.on('paper-account',a=>{
   document.getElementById('a-wr').textContent=(a.winRate*100).toFixed(0)+'%';document.getElementById('a-wr').className='ac-v '+(a.winRate>=.5?'up':'down');
   document.getElementById('a-pnl').textContent=(a.totalPnL>=0?'+':'')+a.totalPnL.toFixed(2);document.getElementById('a-pnl').className='ac-v '+(a.totalPnL>=0?'up':'down');
   document.getElementById('a-pf').textContent=a.profitFactor===Infinity?'∞':a.profitFactor.toFixed(2);
-  // History
-  if(a.trades&&a.trades.length>0){document.getElementById('hist-box').innerHTML=a.trades.slice().reverse().slice(0,15).map(t=>{const p=t.pnlR||0;return'<div class="hi"><span class="hi-d '+t.direction+'">'+t.direction[0].toUpperCase()+'</span><span class="hi-i">'+t.status+'</span><span class="hi-p '+(p>0?'w':'l')+'">'+(p>0?'+':'')+p.toFixed(2)+'R</span></div>'}).join('')}
+  // History with full details
+  if(a.trades&&a.trades.length>0){document.getElementById('hist-box').innerHTML=a.trades.slice().reverse().slice(0,30).map(t=>{
+    const p=t.pnlR||0;const pnlUsd=(p*t.riskAmount).toFixed(2);const dur=t.closeTime&&t.openTime?Math.round((t.closeTime-t.openTime)/60000):0;
+    return'<div style="padding:5px 0;border-bottom:1px solid rgba(42,46,57,.3);font-size:9px;line-height:1.5"><div style="display:flex;justify-content:space-between"><span class="hi-d '+t.direction+'">'+t.direction.toUpperCase()+'</span><span class="hi-p '+(p>0?'w':'l')+'">'+(p>0?'+':'')+p.toFixed(2)+'R ($'+(p>0?'+':'')+pnlUsd+')</span></div><div style="color:var(--t3)">Open: '+t.entry.toFixed(2)+' → Close: '+(t.closePrice||0).toFixed(2)+' | '+t.status+'</div><div style="color:var(--t3)">SL: '+t.stopLoss.toFixed(2)+' | TP1: '+t.takeProfit1.toFixed(2)+' | TP2: '+t.takeProfit2.toFixed(2)+'</div><div style="color:var(--t3)">Setup: '+t.setup+' ['+t.grade+'] | '+dur+'min | Slippage incl.</div></div>'
+  }).join('')}
 });
 
 socket.on('open-positions',ps=>{const c=document.getElementById('pos-box');
   if(!ps||!ps.length){c.innerHTML='<div style="color:var(--t3);text-align:center;padding:6px">No positions</div>';return}
-  c.innerHTML=ps.map(p=>{const rpu=Math.abs(p.entry-p.stopLoss);const pnl=p.direction==='long'?(lastP-p.entry)/rpu:(p.entry-lastP)/rpu;const cls=pnl>=0?'up':'down';
-  return'<div class="pos '+p.direction+'"><div class="pos-hd"><span class="pos-d '+p.direction+'">'+p.direction.toUpperCase()+'</span><button class="pos-x" onclick="closeP(\\''+p.id+'\\')">✕</button></div><div class="pos-info">Entry: '+p.entry.toFixed(2)+' | SL: '+p.stopLoss.toFixed(2)+'<br>PnL: <span style="color:var(--'+cls+')">'+(pnl>=0?'+':'')+pnl.toFixed(2)+'R</span>'+(p.trailingStop?' | Trail:'+p.trailingStop.toFixed(2):'')+'</div></div>'}).join('')});
+  c.innerHTML=ps.map(p=>{const rpu=Math.abs(p.entry-p.stopLoss);const pnl=p.direction==='long'?(lastP-p.entry)/rpu:(p.entry-lastP)/rpu;const pnlUsd=(pnl*p.riskAmount).toFixed(2);const cls=pnl>=0?'up':'down';const dur=Math.round((Date.now()-p.openTime)/60000);
+  return'<div class="pos '+p.direction+'"><div class="pos-hd"><span class="pos-d '+p.direction+'">'+p.direction.toUpperCase()+' '+p.symbol.split(':')[1]+'</span><button class="pos-x" onclick="closeP(\\''+p.id+'\\')">✕ Close</button></div><div class="pos-info">Entry: <b>'+p.entry.toFixed(2)+'</b> (incl. slippage)<br>SL: <span style="color:var(--red)">'+p.stopLoss.toFixed(2)+'</span> | TP1: <span style="color:var(--green)">'+p.takeProfit1.toFixed(2)+'</span> | TP2: <span style="color:var(--green)">'+p.takeProfit2.toFixed(2)+'</span><br>PnL: <span style="color:var(--'+cls+');font-weight:700">'+(pnl>=0?'+':'')+pnl.toFixed(2)+'R ($'+(pnl>=0?'+':'')+pnlUsd+')</span>'+(p.trailingStop?' | Trail: '+p.trailingStop.toFixed(2):'')+'<br>Duration: '+dur+'min | Risk: $'+p.riskAmount.toFixed(2)+' | Setup: '+p.setup+'</div></div>'}).join('')});
 
 socket.on('trade-opened',t=>{lg('🟢 OPEN '+t.direction.toUpperCase()+' @ '+t.entry.toFixed(2)+(t.aiReasoning?' | '+t.aiReasoning.substring(0,80):''),'tr');snd('BUY')});
 socket.on('trade-closed',t=>{const p=t.pnlR||0;lg((p>0?'✅':'❌')+' CLOSE '+(p>0?'+':'')+p.toFixed(2)+'R | '+t.status,'tr');snd(p>0?'BUY':'SELL')});
