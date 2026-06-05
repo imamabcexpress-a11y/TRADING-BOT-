@@ -16,7 +16,8 @@ import { connectToTradingView, getMultiTimeframeData, subscribeToQuotes, Realtim
 import { performMultiTimeframeAnalysis } from '../analysis/multi-timeframe.js';
 import { loadMemory, getPerformanceSummary } from '../agent/memory.js';
 import { PaperTradingEngine } from '../agent/paper-trading.js';
-import { analyzeWithAI, aiDecisionToSignal, AIDecision } from '../agent/ai-analyst.js';
+import { analyzeWithAI, aiDecisionToSignal } from '../agent/ai-analyst.js';
+import type { AIDecision } from '../agent/ai-analyst.js';
 import axios from 'axios';
 
 config();
@@ -95,7 +96,7 @@ io.on('connection', (socket) => {
       try {
         aiDecision = await analyzeWithAI(symbol, techAnalysis, h1Candles, currentPrice);
       } catch (err) {
-        aiDecision = { action: 'WAIT', confidence: 0, entry: currentPrice, stopLoss: 0, takeProfit1: 0, takeProfit2: 0, takeProfit3: 0, riskRewardRatio: 0, reasoning: `AI unavailable: ${err}. Using technical analysis only.`, technicalFactors: [], riskWarnings: ['AI offline'], marketContext: 'Unknown', setup: 'none', grade: 'C', timeframe: 'H1', invalidation: '' };
+        aiDecision = { action: 'WAIT', confidence: 0, entry: currentPrice, stopLoss: 0, takeProfit1: 0, takeProfit2: 0, takeProfit3: 0, riskRewardRatio: 0, reasoning: `AI unavailable: ${err}`, technicalFactors: [], riskWarnings: ['AI offline'], marketContext: 'Unknown', setup: 'none', grade: 'C', timeframe: 'H1', invalidation: '', modelResults: [], bookAnalysis: { tradingInTheZone: { canTrade: false, reason: 'AI error', mindset: '' }, priceActionScalping: { setup: '', pattern: '', signal: '', detail: '' }, artScienceTA: { trend: '', structure: '', srLevels: '', phase: '', emaStatus: '' }, forexFactory: { newsRisk: '', session: '', advice: '' }, multiTimeframe: { daily: '', h4: '', h1: '', m15: '', m5: '' } }, voteSummary: 'AI unavailable' };
       }
 
       lastAIDecision = aiDecision;
@@ -419,9 +420,15 @@ socket.on('ai-decision',d=>{
   const box=document.getElementById('ai-box');
   const confCls=d.confidence>=70?'hi':d.confidence>=50?'md':'lo';
   let lvls='';
-  if(d.action!=='WAIT'){lvls='<div class="ai-lvls"><span class="ai-lbl">Entry</span><span class="ai-val">'+d.entry.toFixed(2)+'</span><span class="ai-lbl">SL</span><span class="ai-val" style="color:var(--red)">'+d.stopLoss.toFixed(2)+'</span><span class="ai-lbl">TP1</span><span class="ai-val" style="color:var(--green)">'+d.takeProfit1.toFixed(2)+'</span><span class="ai-lbl">TP2</span><span class="ai-val" style="color:var(--green)">'+d.takeProfit2.toFixed(2)+'</span><span class="ai-lbl">TP3</span><span class="ai-val" style="color:var(--green)">'+d.takeProfit3.toFixed(2)+'</span><span class="ai-lbl">R:R</span><span class="ai-val" style="color:var(--yellow)">1:'+d.riskRewardRatio.toFixed(1)+'</span><span class="ai-lbl">Setup</span><span class="ai-val">'+d.setup+'</span><span class="ai-lbl">Grade</span><span class="ai-val">'+d.grade+'</span></div>'}
-  box.innerHTML='<div class="ai-box '+d.action+'"><div class="ai-hd"><span class="ai-action '+d.action+'">'+d.action+'</span><span class="ai-conf '+confCls+'">'+d.confidence+'%</span></div><div class="ai-reason">'+d.reasoning+'</div>'+(d.technicalFactors.length?'<div style="margin-top:4px;font-size:9px;color:var(--t2)">'+d.technicalFactors.map(f=>'• '+f).join('<br>')+'</div>':'')+lvls+'</div>';
-  if(d.action!=='WAIT'&&d.confidence>=60){showNf(d);lg('AI: '+d.action+' @ '+d.entry.toFixed(2)+' | '+d.confidence+'% | '+d.setup,'s')}else{lg('AI: WAIT ('+d.confidence+'%) - '+d.reasoning.substring(0,60),'w')}
+  if(d.action!=='WAIT'){lvls='<div class="ai-lvls"><span class="ai-lbl">Entry</span><span class="ai-val">'+d.entry.toFixed(2)+'</span><span class="ai-lbl">SL</span><span class="ai-val" style="color:var(--red)">'+d.stopLoss.toFixed(2)+'</span><span class="ai-lbl">TP1</span><span class="ai-val" style="color:var(--green)">'+d.takeProfit1.toFixed(2)+'</span><span class="ai-lbl">TP2</span><span class="ai-val" style="color:var(--green)">'+d.takeProfit2.toFixed(2)+'</span><span class="ai-lbl">TP3</span><span class="ai-val" style="color:var(--green)">'+d.takeProfit3.toFixed(2)+'</span><span class="ai-lbl">R:R</span><span class="ai-val" style="color:var(--yellow)">1:'+d.riskRewardRatio.toFixed(1)+'</span><span class="ai-lbl">Setup</span><span class="ai-val">'+d.setup+'</span></div>'}
+  // Model votes
+  let modelHtml='';
+  if(d.modelResults&&d.modelResults.length){modelHtml='<div style="margin-top:8px;border-top:1px solid var(--bg3);padding-top:6px"><div style="font-size:9px;font-weight:600;color:var(--t3);margin-bottom:4px">🤖 AI MODEL VOTES ('+d.voteSummary+')</div>'+d.modelResults.map(r=>{const col=r.action==='BUY'?'var(--green)':r.action==='SELL'?'var(--red)':'var(--t3)';return'<div style="display:flex;justify-content:space-between;padding:2px 0;font-size:9px;border-bottom:1px solid rgba(42,46,57,.3)"><span style="color:var(--t2)">'+r.model+'</span><span style="color:'+col+';font-weight:600">'+(r.success?r.action+' '+r.confidence+'%':'❌ '+r.error)+'</span></div>'+(r.success&&r.reasoning?'<div style="font-size:8px;color:var(--t3);padding:1px 0 3px;font-style:italic">'+r.reasoning.substring(0,100)+'</div>':'')}).join('')+'</div>'}
+  // Book analysis
+  let bookHtml='';
+  if(d.bookAnalysis){const b=d.bookAnalysis;bookHtml='<div style="margin-top:8px;border-top:1px solid var(--bg3);padding-top:6px"><div style="font-size:9px;font-weight:600;color:var(--t3);margin-bottom:4px">📚 BOOK ANALYSIS</div><div style="font-size:9px;line-height:1.6;color:var(--t2)"><b style="color:var(--purple)">Zone:</b> '+(b.tradingInTheZone.canTrade?'✅':'❌')+' '+b.tradingInTheZone.reason+'<br><b style="color:var(--yellow)">PA Scalping:</b> '+b.priceActionScalping.setup+' | '+b.priceActionScalping.signal+'<br><b style="color:var(--blue)">Art&Science:</b> '+b.artScienceTA.trend+' | '+b.artScienceTA.phase+' | '+b.artScienceTA.emaStatus+'<br><b style="color:var(--green)">Session:</b> '+b.forexFactory.session+'</div><div style="margin-top:4px;font-size:8px;color:var(--t3)"><b>MTF:</b> D='+b.multiTimeframe.daily.substring(0,30)+' | H4='+b.multiTimeframe.h4.substring(0,25)+' | H1='+b.multiTimeframe.h1.substring(0,25)+'</div></div>'}
+  box.innerHTML='<div class="ai-box '+d.action+'"><div class="ai-hd"><span class="ai-action '+d.action+'">'+d.action+'</span><span class="ai-conf '+confCls+'">'+d.confidence+'%</span></div><div class="ai-reason">'+d.reasoning.substring(0,200)+'</div>'+lvls+modelHtml+bookHtml+'</div>';
+  if(d.action!=='WAIT'&&d.confidence>=55){showNf(d);lg('AI: '+d.action+' @ '+d.entry.toFixed(2)+' | '+d.confidence+'% | Vote:'+d.voteSummary,'s')}else{lg('AI: '+d.action+' ('+d.confidence+'%) Vote:'+d.voteSummary,'w')}
 });
 
 socket.on('paper-account',a=>{
